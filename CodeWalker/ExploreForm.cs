@@ -1,4 +1,4 @@
-﻿using CodeWalker.Forms;
+using CodeWalker.Forms;
 using CodeWalker.GameFiles;
 using CodeWalker.Properties;
 using CodeWalker.Tools;
@@ -187,6 +187,12 @@ namespace CodeWalker
             }
 
 
+            if (GTAFolder.IsGta6)
+            {
+                InitGta6();
+                return;
+            }
+
             Task.Run(() =>
             {
                 try
@@ -226,8 +232,46 @@ namespace CodeWalker
             });
         }
 
+        private void InitGta6()
+        {
+            //GTA VI: keys and cipher tables come from the game exe; no GTA V file cache
+            var exe = GTAFolder.FindGta6Exe();
+            if (exe == null)
+            {
+                using (var ofd = new OpenFileDialog())
+                {
+                    ofd.Title = "Select the GTA VI executable (game_scarlett_master.exe) to read the RPF9 keys from";
+                    ofd.Filter = "Executable (*.exe)|*.exe";
+                    if (ofd.ShowDialog(this) != DialogResult.OK) { UpdateStatus("GTA VI: no game exe selected."); return; }
+                    exe = ofd.FileName;
+                }
+                GTAFolder.SaveGta6Exe(exe);
+            }
+            var names = GTAFolder.FindGta6Names();
+            Task.Run(() =>
+            {
+                try
+                {
+                    UpdateStatus("Loading GTA VI keys from " + exe + "...");
+                    Rpf9Keys.Load(exe, names);
+                    GTAFolder.Gta6Exe = exe;
+                }
+                catch (Exception ex)
+                {
+                    UpdateStatus("Unable to load GTA VI keys: " + ex.Message);
+                    return;
+                }
+                UpdateStatus(string.Format("{0} names, {1} TOC keys, {2} data keys. Scanning...", Rpf9Keys.Names.Count, Rpf9Keys.TocCiphers.Count, Rpf9Keys.DataCiphers.Count));
+
+                RefreshMainTreeView();
+
+                UpdateStatus("Scan complete.");
+            });
+        }
+
         private void InitFileCache()
         {
+            if (GTAFolder.IsGta6) return;
             Task.Run(() =>
             {
                 lock (FileCacheSyncRoot)
@@ -320,6 +364,82 @@ namespace CodeWalker
             InitSubFileType(".dat", "heightmapheistisland.dat", "Heightmap", 6, FileTypeAction.ViewHeightmap, true);
             InitSubFileType(".dat", "distantlights.dat", "Distant Lights", 6, FileTypeAction.ViewDistantLights);
             InitSubFileType(".dat", "distantlights_hd.dat", "Distant Lights", 6, FileTypeAction.ViewDistantLights);
+
+            if (GTAFolder.IsGta6) InitGta6FileTypes();
+        }
+        private void InitGta6FileTypes()
+        {
+            //GTA VI (RPF9) extensions, from the exe's extension id tables. GTA V viewers don't understand these formats.
+            InitFileType(".mrf", "Move Network File (GTA VI)", 18);
+            InitFileType(".cut", "Cutscene (GTA VI)", 12);
+            InitFileType(".gfx", "Scaleform Flash", 7);
+            InitFileType(".zmf", "Manifest", 14);
+            InitFileType(".zdr", "Drawable", 11, FileTypeAction.ViewModel);
+            InitFileType(".zft", "Fragment", 11, FileTypeAction.ViewModel);
+            InitFileType(".zdd", "Drawable Dictionary", 12, FileTypeAction.ViewModel);
+            InitFileType(".ztd", "Texture Dictionary", 16, FileTypeAction.ViewYtd);
+            InitFileType(".zbn", "Static Collisions", 19);
+            InitFileType(".zbd", "Bounds Dictionary", 19);
+            InitFileType(".zpd", "Physics Dictionary", 19);
+            InitFileType(".zbs", "Blend Shapes", 9);
+            InitFileType(".zsd", "Shader Data", 9);
+            InitFileType(".zmt", "Metadata (PSIN / PRD0)", 6, FileTypeAction.ViewXml, true);
+            InitFileType(".zsc", "Script", 13);
+            InitFileType(".zcs", "Compiled Shaders", 9);
+            InitFileType(".zdatb", "Data", 9);
+            InitFileType(".zbdr", "Drawable (ZBDR)", 11);
+            InitFileType(".zbdd", "Drawable Dictionary (ZBDD)", 12);
+            InitFileType(".zbft", "Fragment (ZBFT)", 11);
+            InitFileType(".zvert", "Vertex Data", 9);
+            InitFileType(".zcd", "Clip Dictionary", 18);
+            InitFileType(".zld", "Cloth Dictionary", 9);
+            InitFileType(".zpmd", "Parameterized Motion Dictionary", 18);
+            InitFileType(".zpm", "Parameterized Motion", 18);
+            InitFileType(".zed", "Expression Dictionary", 9);
+            InitFileType(".zpt", "Particle Effect", 18);
+            InitFileType(".zmap", "Map Data", 21);
+            InitFileType(".ztyp", "Archetype Definitions (PRD0)", 20, FileTypeAction.ViewXml, true);
+            InitFileType(".zch", "Clip Hierarchy", 18);
+            InitFileType(".zldb", "Level Database", 9);
+            InitFileType(".zjd", "Joint Data", 9);
+            InitFileType(".zad", "Animation Data", 18);
+            InitFileType(".znv", "Nav Mesh", 9);
+            InitFileType(".znvs", "Nav Mesh Set", 9);
+            InitFileType(".zpl", "Point List", 9);
+            InitFileType(".znd", "Path Nodes", 8);
+            InitFileType(".zvr", "Vehicle Record", 9);
+            InitFileType(".zwr", "Waypoint Record", 9);
+            InitFileType(".znh", "Nav Hierarchy", 9);
+            InitFileType(".zfd", "Frame Filter Dictionary", 9);
+            InitFileType(".zas", "Asset (PRD0)", 20);
+            InitFileType(".zsm", "Strand / Skeletal Mesh", 11);
+            InitFileType(".zscript", "Script", 13);
+            InitFileType(".zascript", "Script", 13);
+            InitFileType(".zsma", "ZSMA", 9);
+            InitFileType(".iasf", "IASF", 9);
+            InitFileType(".zfc", "Metadata (PSIN, ZFC)", 6, FileTypeAction.ViewXml, true);
+            InitFileType(".zlfc", "Metadata (PSIN, ZLFC)", 6, FileTypeAction.ViewXml, true);
+            InitFileType(".zcg", "ZCG", 9);
+            InitFileType(".zasd", "ZASD", 9);
+            InitFileType(".rdb", "RDB", 9);
+            InitFileType(".zfbs", "ZFBS", 9);
+            InitFileType(".zcps", "ZCPS", 9);
+            InitFileType(".zsp", "ZSP", 9);
+            InitFileType(".ztsl", "ZTSL", 9);
+            InitFileType(".zmmd", "ZMMD", 9);
+            InitFileType(".zfid", "Face Morph Data", 9);
+            InitFileType(".zmsk", "Mask", 9);
+            InitFileType(".zhdat", "ZHDAT", 9);
+            InitFileType(".znmd", "ZNMD", 9);
+            InitFileType(".zsmm", "ZSMM", 9);
+            InitFileType(".zascd", "Asset (PRD0, ZASCD)", 20);
+            InitFileType(".zrd", "ZRD", 9);
+            InitFileType(".zsmam", "ZSMAM", 9);
+            InitFileType(".zldbmt", "Level Database Metadata (PRD0)", 20, FileTypeAction.ViewXml, true);
+            InitFileType(".zkit", "Kit (PRD0)", 20, FileTypeAction.ViewXml, true);
+            InitFileType(".zcgc", "ZCGC", 9);
+            InitFileType(".zcov", "ZCOV", 9);
+            InitFileType(".bin", "File", 4);
         }
         private void InitFileType(string ext, string name, int imgidx, FileTypeAction defaultAction = FileTypeAction.ViewHex, bool xmlConvertible = false)
         {
@@ -717,6 +837,8 @@ namespace CodeWalker
         {
             Ready = false;
             AllRpfs = null;
+            gta6Textures?.Dispose();   // reopened on the next model view, picking up new packs
+            gta6Textures = null;
 
             ClearMainTreeView();
 
@@ -725,7 +847,7 @@ namespace CodeWalker
             var root = new MainTreeFolder();
             root.FullPath = GTAFolder.GetCurrentGTAFolderWithTrailingSlash();
             root.Path = "";
-            root.Name = "GTA V";
+            root.Name = GTAFolder.IsGta6 ? "GTA VI" : "GTA V";
             RootFolder = root;
 
             RefreshMainTreeViewRoot(root);
@@ -1514,6 +1636,21 @@ namespace CodeWalker
             }
 
             var fentry = file?.File;
+            if (fentry is Rpf9FileEntry f9)
+            {
+                //GTA VI: PSIN / PRD0 metadata, or a plain text XML file
+                if (!Rpf9Psin.IsMetadata(data, f9) && IsTextXml(data))
+                {
+                    newfn = f9.Name;
+                    return Encoding.UTF8.GetString(data).TrimStart('﻿');
+                }
+                string x9 = null;
+                try { x9 = Rpf9Psin.ToXml(data, f9); }
+                catch (Exception ex) { errorAction("Unable to convert file to XML: " + file.Path + " (" + ex.Message + ")"); return null; }
+                if (x9 == null) { errorAction("Not PSIN/PRD0 metadata: " + file.Path); return null; }
+                newfn = f9.Name + ".xml";
+                return x9;
+            }
             if (fentry == null)
             {
                 //this should only happen when opening a file from filesystem...
@@ -1618,6 +1755,12 @@ namespace CodeWalker
                 { 
                     //this should only happen when opening a file from filesystem...
                     fe = CreateFileEntry(name, path, ref data);
+                }
+
+                if (fe is Rpf9FileEntry fe9)
+                {
+                    if (ViewRpf9Meta(name, path, data, fe9)) return;
+                    if (ft.DefaultAction == FileTypeAction.ViewXml && !IsTextXml(data)) { ViewHex(name, path, data); return; } //binary metadata that didn't decode
                 }
 
                 switch (ft.DefaultAction)
@@ -1756,9 +1899,42 @@ namespace CodeWalker
             f.Show();
             f.LoadData(name, path, data);
         }
+        /// <summary>true for text XML (optional UTF-8 BOM and leading whitespace, then '&lt;'), as opposed to binary metadata</summary>
+        private static bool IsTextXml(byte[] data)
+        {
+            if (data == null) return false;
+            int i = (data.Length >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF) ? 3 : 0;
+            while (i < data.Length && (data[i] == ' ' || data[i] == '\t' || data[i] == '\r' || data[i] == '\n')) i++;
+            return i < data.Length && data[i] == '<';
+        }
+        /// <summary>GTA VI PSIN / PRD0 metadata (any extension) -> decoded XML in the XML viewer. false if it isn't metadata.</summary>
+        private bool ViewRpf9Meta(string name, string path, byte[] data, Rpf9FileEntry e)
+        {
+            if (!Rpf9Psin.IsMetadata(data, e)) return false;
+            string xml;
+            try
+            {
+                Cursor = Cursors.WaitCursor;
+                xml = Rpf9Psin.ToXml(data, e);
+            }
+            catch (Exception ex)
+            {
+                UpdateStatus(name + ": metadata decode failed (" + ex.GetType().Name + ": " + ex.Message + "), showing hex");
+                return false;
+            }
+            finally
+            {
+                Cursor = Cursors.Default;
+            }
+            if (xml == null) return false;
+            XmlForm f = new XmlForm(this);
+            f.Show();
+            f.LoadXml(name + ".xml", path + ".xml", xml, null); //no RPF entry: saving goes to a file, never back into the archive
+            return true;
+        }
         private void ViewXml(string name, string path, byte[] data, RpfFileEntry e)
         {
-            string xml = Encoding.UTF8.GetString(data);
+            string xml = Encoding.UTF8.GetString(data).TrimStart('﻿'); //drop the UTF-8 BOM (EF BB BF)
             XmlForm f = new XmlForm(this);
             f.Show();
             f.LoadXml(name, path, xml, e);
@@ -1772,6 +1948,24 @@ namespace CodeWalker
         }
         private void ViewYtd(string name, string path, byte[] data, RpfFileEntry e)
         {
+            if (e is Rpf9FileEntry e9)
+            {
+                //GTA VI texture dictionary
+                var notes = new List<string>();
+                var td = Rpf9Texture.ReadDictionary(data, e9.VirtualSize, notes);
+                if (td == null)
+                {
+                    MessageBox.Show("Not a texture dictionary this version understands.", name);
+                    ViewHex(name, path, data);
+                    return;
+                }
+                var ytd9 = new YtdFile { Name = name, RpfFileEntry = e, TextureDict = td };
+                YtdForm f9 = new YtdForm(this);
+                f9.Show();
+                f9.LoadYtd(ytd9);
+                if (notes.Count > 0) UpdateStatus(name + ": " + notes.Count + " texture(s) skipped: " + string.Join("; ", notes.Take(5)));
+                return;
+            }
             var ytd = RpfFile.GetFile<YtdFile>(e, data);
             YtdForm f = new YtdForm(this);
             f.Show();
@@ -1812,8 +2006,65 @@ namespace CodeWalker
             f.Show();
             f.LoadMeta(pso);
         }
+        private Rpf9TextureStore gta6Textures;
+        /// <summary>GTA VI streamed textures: every *.ttpf under the game folder (opened on first use).</summary>
+        private Rpf9TextureStore Gta6Textures
+        {
+            get
+            {
+                if (gta6Textures == null)
+                {
+                    var folder = GTAFolder.GetCurrentGTAFolderWithTrailingSlash();
+                    if (string.IsNullOrEmpty(folder) || !Directory.Exists(folder)) return null;
+                    gta6Textures = new Rpf9TextureStore(folder);
+                }
+                return gta6Textures;
+            }
+        }
+
         private void ViewModel(string name, string path, byte[] data, RpfFileEntry e)
         {
+            if (e is Rpf9FileEntry e9)
+            {
+                //GTA VI drawable / drawable dictionary / fragment
+                var notes = new List<string>();
+                List<Rpf9Drawable.Item> items;
+                Cursor = Cursors.WaitCursor;
+                int textured = 0, texShaders = 0;
+                string texNote = "";
+                try
+                {
+                    items = Rpf9Drawable.Read(data, e9.VirtualSize, notes);
+                    try
+                    {
+                        var store = Gta6Textures;
+                        if (store != null && store.KeyCount > 0)
+                        {
+                            int errs = store.Errors.Count;
+                            textured = store.Apply(items);
+                            if (store.Errors.Count > errs) texNote = "; texture errors: " + string.Join("; ", store.Errors.Skip(errs).Take(2));
+                        }
+                        else texNote = "; no TTDB texture packs (*.ttpf) found";
+                    }
+                    catch (Exception ex) { texNote = "; textures failed: " + ex.Message; }
+                    texShaders = items.Sum(i => i.TexRefs.Select(t => t.Shader).Distinct().Count());
+                }
+                finally { Cursor = Cursors.Default; }
+                var gf = Rpf9Drawable.ToGameFile(name, e, items);
+                if (gf == null)
+                {
+                    MessageBox.Show("No drawable this version understands." + (notes.Count > 0 ? "\n" + string.Join("\n", notes.Take(5)) : ""), name);
+                    ViewHex(name, path, data);
+                    return;
+                }
+                ModelForm f9 = new ModelForm(this);
+                f9.Show();
+                if (gf is YdrFile ydr9) f9.LoadModel(ydr9);
+                else if (gf is YddFile ydd9) f9.LoadModels(ydd9);
+                int ntri = items.Sum(i => i.Triangles);
+                UpdateStatus(name + ": " + items.Count + " drawable(s), " + ntri.ToString("N0") + " triangles, " + textured + "/" + texShaders + " shaders textured" + texNote + (notes.Count > 0 ? "; " + notes.Count + " skipped: " + string.Join("; ", notes.Take(3)) : ""));
+                return;
+            }
             var nl = e?.NameLower ?? "";
             var fe = Path.GetExtension(nl);
             ModelForm f = new ModelForm(this);

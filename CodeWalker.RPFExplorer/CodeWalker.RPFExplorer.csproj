@@ -20,4 +20,9 @@
     <ProjectReference Include="..\CodeWalker\CodeWalker.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- compiled renderer shaders, needed by the model viewer -->
+    <None Include="..\Shaders\*.cso" Link="Shaders\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>

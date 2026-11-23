@@ -2618,7 +2618,7 @@ namespace CodeWalker.GameFiles
             lock (textureSyncRoot)
             {
                 RpfFileEntry e;
-                if (textureLookup.TryGetValue(hash, out e))
+                if (textureLookup?.TryGetValue(hash, out e) ?? false) //null when the cache isn't inited (eg. GTA VI)
                 {
                     return GetYtd(e.ShortNameHash);
                 }
@@ -2629,7 +2629,7 @@ namespace CodeWalker.GameFiles
         public YtdFile TryGetParentYtd(uint hash)
         {
             MetaHash phash;
-            if (textureParents.TryGetValue(hash, out phash))
+            if (textureParents?.TryGetValue(hash, out phash) ?? false)
             {
                 return GetYtd(phash);
             }
@@ -2638,7 +2638,7 @@ namespace CodeWalker.GameFiles
         public uint TryGetParentYtdHash(uint hash)
         {
             MetaHash phash = 0;
-            textureParents.TryGetValue(hash, out phash);
+            textureParents?.TryGetValue(hash, out phash);
             return phash;
         }
         public uint TryGetHDTextureHash(uint txdhash)

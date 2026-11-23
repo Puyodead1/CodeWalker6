@@ -164,7 +164,7 @@ namespace CodeWalker.Utils
                     px = DecompressBC5(imgdata, w, h);
                     break;
                 case DXGI_FORMAT.DXGI_FORMAT_BC7_UNORM: // TextureFormat.D3DFMT_BC7
-                    //BC7 TODO!!
+                    px = Bc7.Decode(imgdata, w, h);
                     break;
 
                 // uncompressed

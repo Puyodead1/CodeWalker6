@@ -16,10 +16,81 @@ namespace CodeWalker
     {
         public static string CurrentGTAFolder { get; private set; } = Settings.Default.GTAFolder;
         public static bool IsGen9 { get; private set; } = Settings.Default.GTAGen9;
+        public static bool IsGta6 { get; private set; } = IsGta6Folder(Settings.Default.GTAFolder);
 
         public static bool IsGen9Folder(string folder)
         {
             return File.Exists(folder + @"\gta5_enhanced.exe");
+        }
+
+        /// <summary>a GTA VI folder: holds .rpf archives in RPF9 format</summary>
+        public static bool IsGta6Folder(string folder)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(folder) || !Directory.Exists(folder)) return false;
+                foreach (var f in Directory.EnumerateFiles(folder, "*.rpf"))
+                {
+                    using (var fs = File.OpenRead(f))
+                    {
+                        var b = new byte[4];
+                        if (fs.Read(b, 0, 4) == 4 && BitConverter.ToUInt32(b, 0) == 0x52504639) return true;
+                    }
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        /// <summary>use a GTA VI folder for this session only (doesn't change the saved GTA V folder)</summary>
+        public static bool UseGta6Folder(string folder)
+        {
+            if (!IsGta6Folder(folder)) return false;
+            CurrentGTAFolder = folder.TrimEnd('\\');
+            IsGen9 = false;
+            IsGta6 = true;
+            return true;
+        }
+
+        /// <summary>GTA VI: the game exe (keys and cipher tables are read from it) and the hash names list</summary>
+        public static string Gta6Exe { get; set; }
+        public static string Gta6Names { get; set; }
+        static string Gta6ConfigPath => Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "CodeWalker.Gta6.txt");
+
+        public static string FindGta6Exe()
+        {
+            var cands = new List<string>();
+            if (!string.IsNullOrEmpty(Gta6Exe)) cands.Add(Gta6Exe);
+            try
+            {
+                foreach (var line in File.ReadAllLines(Gta6ConfigPath))
+                {
+                    if (line.StartsWith("exe=")) cands.Add(line.Substring(4).Trim());
+                }
+            }
+            catch { }
+            if (!string.IsNullOrEmpty(CurrentGTAFolder))
+            {
+                cands.Add(Path.Combine(CurrentGTAFolder, "game_scarlett_master.exe"));
+                cands.Add(Path.Combine(CurrentGTAFolder, @"..\game_exe\game_scarlett_master.exe"));
+            }
+            return cands.FirstOrDefault(File.Exists);
+        }
+
+        public static void SaveGta6Exe(string exe)
+        {
+            Gta6Exe = exe;
+            try { File.WriteAllText(Gta6ConfigPath, "exe=" + exe + "\r\n"); } catch { }
+        }
+
+        public static string FindGta6Names()
+        {
+            var cands = new List<string>();
+            if (!string.IsNullOrEmpty(Gta6Names)) cands.Add(Gta6Names);
+            cands.Add(Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "rpf9_names.tsv"));
+            var exe = Gta6Exe ?? FindGta6Exe();
+            if (exe != null) cands.Add(Path.Combine(Path.GetDirectoryName(exe), @"..\namelists\rpf9_names.tsv"));
+            return cands.FirstOrDefault(File.Exists);
         }
 
         public static bool ValidateGTAFolder(string folder, bool gen9, out string failReason)
@@ -36,6 +107,11 @@ namespace CodeWalker
             {
                 failReason = $"Folder \"{folder}\" does not exist";
                 return false;
+            }
+
+            if (IsGta6Folder(folder))
+            {
+                return true;
             }
 
             if (gen9)
@@ -124,7 +200,8 @@ namespace CodeWalker
             if(ValidateGTAFolder(folder, gen9))
             {
                 CurrentGTAFolder = folder;
-                IsGen9 = gen9;
+                IsGta6 = IsGta6Folder(folder);
+                IsGen9 = gen9 && !IsGta6;
                 Settings.Default.GTAFolder = folder;
                 Settings.Default.GTAGen9 = gen9;
                 Settings.Default.Save();
@@ -204,7 +281,8 @@ namespace CodeWalker
         }
         public static void UpdateEnhancedFormTitle(Form form)
         {
-            if (IsGen9) form.Text = GetEnhancedFormTitle(form.Text);
+            if (IsGta6) form.Text = form.Text + " (GTA VI)";
+            else if (IsGen9) form.Text = GetEnhancedFormTitle(form.Text);
         }
     }
 }

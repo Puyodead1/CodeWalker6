@@ -43,6 +43,10 @@ namespace CodeWalker.GameFiles
 
         public BinaryReader CurrentFileReader { get; set; } //for temporary use while reading header
 
+        //GTA VI (RPF9)
+        public bool IsRpf9 { get; set; }
+        public string Rpf9DataPath { get; set; } //nested RPF9: decompressed copy in the cache folder
+
 
 
         public uint TotalFileCount { get; set; }
@@ -295,6 +299,18 @@ namespace CodeWalker.GameFiles
         }
         private void ScanStructure(BinaryReader br, Action<string> updateStatus, Action<string> errorLog)
         {
+            if (Parent == null && br.BaseStream.Length >= 4)
+            {
+                long pos = br.BaseStream.Position;
+                uint magic = br.ReadUInt32();
+                br.BaseStream.Position = pos;
+                if (Rpf9Archive.IsRpf9(magic))
+                {
+                    Rpf9Archive.Scan(this, updateStatus, errorLog);
+                    return;
+                }
+            }
+
             ReadHeader(br);
 
             GrandTotalRpfCount = 1; //count this file..
@@ -503,6 +519,10 @@ namespace CodeWalker.GameFiles
         {
             try
             {
+                if (entry is Rpf9FileEntry r9)
+                {
+                    return Rpf9Archive.ExtractFile(r9);
+                }
                 using (BinaryReader br = new BinaryReader(File.OpenRead(GetPhysicalFilePath())))
                 {
                     if (entry is RpfBinaryFileEntry)
