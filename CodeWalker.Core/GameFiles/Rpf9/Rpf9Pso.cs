@@ -12,7 +12,7 @@ namespace CodeWalker.GameFiles
     /// big endian, GTA V schema type codes. Port of tools\pso9.py. Differences from GTA V:
     /// <list type="bullet">
     /// <item>pointers are 8 bytes, w0 w1 (u32 BE): block id = w0 &amp; 0xFFF (1-based), byte offset = (w0 &gt;&gt; 20) | (w1 &gt;&gt; 24) &lt;&lt; 12</item>
-    /// <item>array subtype 10: { u32 count, u32 capacity, pointer }; subtypes 1, 2, 4: inline, count = ref &gt;&gt; 16</item>
+    /// <item>array subtype 10: { u32 count, u32 capacity, pointer }; subtypes 1, 2, 4, 129: inline, count = ref &gt;&gt; 16</item>
     /// <item>string subtype 3: 16 bytes, inline text if the last byte has 0x80 (length in the low bits), else a pointer;
     /// subtype 14: 64-bit hash</item>
     /// <item>enum subtype 1: 32-bit; type 0x24: quaternion; 0x13: vec4</item>
