@@ -680,6 +680,9 @@ namespace CodeWalker.GameFiles
                         idx.Add((ushort)map[vi]);
                     }
                 }
+                // A mesh of one triangle is a placeholder (the fur_* metaped parts hold a 2 cm standard_rdp
+                // triangle beside their hair strands): keep it so the part still loads, but collapse it.
+                if (ntri == 1) { idx[1] = idx[0]; idx[2] = idx[0]; }
                 geoms.Add(MakeGeometry(m, used, idx.ToArray(), shader, out var bb));
                 bounds.Add(bb);
                 foreach (var vi in used) map[vi] = -1;
