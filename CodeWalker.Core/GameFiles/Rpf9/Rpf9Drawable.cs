@@ -231,6 +231,7 @@ namespace CodeWalker.GameFiles
             else { Bad("vertex block magic " + magic.ToString("x")); return null; }
             m.VertexCount = nv;
 
+            byte[] w2 = null, j2 = null;   // slots 7 / 9: second set of 4 weights / blend indices
             foreach (var s in slots)
             {
                 int slot = s[0], o = s[1], fm = s[2];
@@ -279,8 +280,59 @@ namespace CodeWalker.GameFiles
                     m.Joints = new byte[4 * nv];
                     Buffer.BlockCopy(g, p, m.Joints, 0, 4 * nv);
                 }
+                else if (slot == 7 && fm == 0x26)
+                {
+                    w2 = new byte[4 * nv];
+                    Buffer.BlockCopy(g, p, w2, 0, 4 * nv);
+                }
+                else if (slot == 9 && fm == 0x25)
+                {
+                    j2 = new byte[4 * nv];
+                    Buffer.BlockCopy(g, p, j2, 0, 4 * nv);
+                }
             }
+            if (m.Weights != null && m.Joints != null && w2 != null && j2 != null) Keep4(m, w2, j2);
             return m;
+        }
+
+        /// <summary>Slots 7/9 are a second set of 4 weights / blend indices (8 influences; slots 6 + 7 weights sum
+        /// to 255). The renderer's skinned vertex takes 4: keep the 4 heaviest bones and scale them to sum to 255.</summary>
+        static void Keep4(Mesh m, byte[] w2, byte[] j2)
+        {
+            var jj = new int[8];
+            var ww = new int[8];
+            for (int v = 0; v < m.VertexCount; v++)
+            {
+                int n = 0;
+                for (int k = 0; k < 8; k++)
+                {
+                    int w = k < 4 ? m.Weights[4 * v + k] : w2[4 * v + k - 4];
+                    int j = k < 4 ? m.Joints[4 * v + k] : j2[4 * v + k - 4];
+                    if (w == 0) continue;
+                    int e = Array.IndexOf(jj, j, 0, n);
+                    if (e >= 0) ww[e] += w;
+                    else { jj[n] = j; ww[n] = w; n++; }
+                }
+                // partial selection sort: the 4 heaviest first
+                for (int a = 0; a < Math.Min(4, n); a++)
+                {
+                    int best = a;
+                    for (int b = a + 1; b < n; b++) if (ww[b] > ww[best]) best = b;
+                    (ww[a], ww[best]) = (ww[best], ww[a]);
+                    (jj[a], jj[best]) = (jj[best], jj[a]);
+                }
+                int keep = Math.Min(4, n), sum = 0;
+                for (int a = 0; a < keep; a++) sum += ww[a];
+                int acc = 0;
+                for (int k = 0; k < 4; k++)
+                {
+                    int w = k < keep && sum > 0 ? (int)Math.Round(ww[k] * 255.0 / sum) : 0;
+                    m.Weights[4 * v + k] = (byte)Math.Min(255, w);
+                    m.Joints[4 * v + k] = k < keep ? (byte)jj[k] : (byte)0;
+                    acc += m.Weights[4 * v + k];
+                }
+                if (keep > 0) m.Weights[4 * v] = (byte)Math.Max(0, Math.Min(255, m.Weights[4 * v] + 255 - acc));
+            }
         }
 
         static void Octahedral(double u, double v, out double x, out double y, out double z)
