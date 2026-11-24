@@ -1771,7 +1771,8 @@ namespace CodeWalker
                     if ((fe9.NameLower ?? "").EndsWith(".zkit") && ViewGta6Kit(name, path, data, fe9)) return;
                     if (ViewRpf9Meta(name, path, data, fe9)) return;
                     if (ViewRpf9SecMotion(name, path, data, fe9)) return;
-                    if (ft.DefaultAction == FileTypeAction.ViewXml && !IsTextXml(data)) { ViewHex(name, path, data); return; } //binary metadata that didn't decode
+                    if (ft.DefaultAction == FileTypeAction.ViewXml && !IsTextXml(data)) { ViewRpf9Info(name, path, data, fe9); return; } //binary metadata that didn't decode
+                    if (ft.DefaultAction == FileTypeAction.ViewHex) { ViewRpf9Info(name, path, data, fe9); return; } //no viewer: text summary
                 }
 
                 switch (ft.DefaultAction)
@@ -2160,6 +2161,19 @@ namespace CodeWalker
                 catch (Exception ex) { notes.Add(fe.Name + ": " + ex.Message); }
             }
             return res;
+        }
+
+        /// <summary>GTA VI file without a viewer: a text summary (TOC facts, decoded headers, pointer/array/string census).</summary>
+        private void ViewRpf9Info(string name, string path, byte[] data, Rpf9FileEntry e)
+        {
+            string txt;
+            Cursor = Cursors.WaitCursor;
+            try { txt = Rpf9Info.Summary(e, data) + "\r\n(Right-click > View Hex shows every byte.)"; }
+            catch (Exception ex) { txt = "No summary: " + ex.Message; }
+            finally { Cursor = Cursors.Default; }
+            TextForm tf = new TextForm(this);
+            tf.Show();
+            tf.LoadReadOnlyText(name + ".txt", path, txt.Replace("\r\n", "\n").Replace("\n", "\r\n"));
         }
 
         /// <summary>GTA VI .zsm / .zsmam: text view. Returns false for other files.</summary>
