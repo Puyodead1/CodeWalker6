@@ -32,7 +32,17 @@ namespace CodeWalker.RPFExplorer
 
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
-            Application.Run(new ExploreForm());
+            var form = new ExploreForm();
+            form.FormClosed += (s, e) =>
+            {
+                // ExploreForm has saved its settings by now (its own FormClosed handler runs first). Tearing the window
+                // down would delete the folder tree node by node (one notification per node, seconds of lag for the
+                // GTA VI tree and system-wide accessibility events), so end the process here instead.
+                GTAFolder.UpdateSettings();
+                form.Hide();
+                Environment.Exit(0);
+            };
+            Application.Run(form);
 
             GTAFolder.UpdateSettings();
         }

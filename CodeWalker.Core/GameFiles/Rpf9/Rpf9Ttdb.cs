@@ -205,6 +205,36 @@ namespace CodeWalker.GameFiles
             }
         }
 
+        /// <summary>A texture with size/format only (no pixel data), named by its key: for listing a pack.
+        /// Fill it with <see cref="Load"/>.</summary>
+        public Texture Placeholder(ulong key)
+        {
+            var t = GetRecord(Index[key]);
+            var tex = new Texture
+            {
+                Name = key.ToString("x16"),
+                NameHash = (uint)key,
+                Width = (ushort)t.W,
+                Height = (ushort)t.H,
+                Depth = 1,
+                Levels = (byte)t.Mips,
+                Format = Rpf9Texture.LegacyFormat(t.Fmt),
+                G9_Format = (TextureFormatG9)t.Fmt,
+            };
+            tex.Stride = tex.CalculateStride();
+            return tex;
+        }
+
+        /// <summary>Decodes a <see cref="Placeholder"/> in place (size may shrink when BCPack.dll is missing).</summary>
+        public void Load(Texture tex)
+        {
+            if (tex.Data != null) return;
+            var full = GetTexture(ulong.Parse(tex.Name, System.Globalization.NumberStyles.HexNumber));
+            if (full == null) throw new InvalidDataException("texture not in this pack");
+            tex.Width = full.Width; tex.Height = full.Height; tex.Levels = full.Levels; tex.Stride = full.Stride;
+            tex.Data = full.Data;
+        }
+
         /// <summary>Just the small mips (largest side at most maxDim, at least 1 mip): cheap, for classifying textures.</summary>
         public Texture GetTextureMip(ulong key, int maxDim)
         {

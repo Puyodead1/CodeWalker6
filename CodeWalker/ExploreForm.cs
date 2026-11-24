@@ -378,6 +378,7 @@ namespace CodeWalker
             InitFileType(".zft", "Fragment", 11, FileTypeAction.ViewModel);
             InitFileType(".zdd", "Drawable Dictionary", 12, FileTypeAction.ViewModel);
             InitFileType(".ztd", "Texture Dictionary", 16, FileTypeAction.ViewYtd);
+            InitFileType(".ttpf", "Texture Pack (TTDB)", 16, FileTypeAction.ViewYtd);
             InitFileType(".zbn", "Static Collisions", 19);
             InitFileType(".zbd", "Bounds Dictionary", 19);
             InitFileType(".zpd", "Physics Dictionary", 19);
@@ -1728,6 +1729,12 @@ namespace CodeWalker
                     return;
                 }
 
+                if (item.File == null && (item.FullPath?.EndsWith(".ttpf", StringComparison.OrdinalIgnoreCase) ?? false))
+                {
+                    ViewTtdb(item.FullPath); //GTA VI texture packs are GBs: list them without reading the whole file
+                    return;
+                }
+
                 byte[] data = null;
                 string name = "";
                 string path = "";
@@ -1945,6 +1952,23 @@ namespace CodeWalker
             TextForm f = new TextForm(this);
             f.Show();
             f.LoadText(name, path, txt, e);
+        }
+        private void ViewTtdb(string path)
+        {
+            var name = Path.GetFileName(path);
+            Rpf9Ttdb pack;
+            try { pack = new Rpf9Ttdb(path); }
+            catch (Exception ex) { MessageBox.Show("Unable to open texture pack: " + ex.Message, name); return; }
+            var list = new List<Texture>();
+            foreach (var k in pack.Index.Keys) list.Add(pack.Placeholder(k));
+            var td = new TextureDictionary();
+            td.BuildFromTextureList(list);
+            var f = new YtdForm(this);
+            f.TextureLoader = t => pack.Load(t);
+            f.FormClosed += (s, a) => pack.Dispose();
+            f.Show();
+            f.LoadYtd(new YtdFile { Name = name, TextureDict = td });
+            UpdateStatus(name + ": " + list.Count + " textures (named by TTDB key; decoded when selected)");
         }
         private void ViewYtd(string name, string path, byte[] data, RpfFileEntry e)
         {

@@ -25,6 +25,8 @@ namespace CodeWalker.Forms
         private bool Modified = false;
         private ExploreForm ExploreForm = null;
         private ModelForm ModelForm = null;
+        /// <summary>Decodes a listed texture that has no data yet (GTA VI texture packs are listed without decoding).</summary>
+        public Action<Texture> TextureLoader;
 
 
         public YtdForm(ExploreForm exploreForm = null, ModelForm modelForm = null)
@@ -32,6 +34,44 @@ namespace CodeWalker.Forms
             ExploreForm = exploreForm;
             ModelForm = modelForm;
             InitializeComponent();
+            InitChannelCombo();
+        }
+
+        //channel view: packed material maps (GTA VI) are greyscale masks in R/G/B/A that look tinted when combined
+        private ComboBox SelTextureChannelCombo;
+        private void InitChannelCombo()
+        {
+            SelTextureChannelCombo = new ComboBox
+            {
+                Anchor = AnchorStyles.Bottom | AnchorStyles.Right,
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                Location = new System.Drawing.Point(SelTextureZoomCombo.Left - 120, SelTextureZoomCombo.Top),
+                Size = new System.Drawing.Size(60, 21),
+                Name = "SelTextureChannelCombo",
+            };
+            SelTextureChannelCombo.Items.AddRange(new object[] { "RGBA", "RGB", "R", "G", "B", "A" });
+            SelTextureChannelCombo.SelectedIndex = 0;
+            SelTextureChannelCombo.SelectedIndexChanged += (s, e) =>
+            {
+                if (CurrentTexture != null) ShowTextureMip(CurrentTexture, SelTextureMipTrackBar.Value, true);
+            };
+            new ToolTip().SetToolTip(SelTextureChannelCombo, "Channels to show (R/G/B/A = that channel as greyscale)");
+            SelTextureZoomCombo.Parent.Controls.Add(SelTextureChannelCombo);
+            SelTextureChannelCombo.BringToFront();
+        }
+
+        /// <summary>BGRA pixels -> the selected channel view (in place)</summary>
+        private void ApplyChannelView(byte[] px)
+        {
+            int sel = SelTextureChannelCombo?.SelectedIndex ?? 0;
+            if (sel <= 0 || px == null) return;
+            if (sel == 1) { for (int i = 3; i < px.Length; i += 4) px[i] = 255; return; }
+            int src = sel == 2 ? 2 : sel == 3 ? 1 : sel == 4 ? 0 : 3; //BGRA offsets of R, G, B, A
+            for (int i = 0; i + 3 < px.Length; i += 4)
+            {
+                byte v = px[i + src];
+                px[i] = v; px[i + 1] = v; px[i + 2] = v; px[i + 3] = 255;
+            }
         }
 
 
@@ -135,6 +175,26 @@ namespace CodeWalker.Forms
             RemoveTextureButton.Enabled = true;
             ReplaceTextureButton.Enabled = true;
 
+            if (tex.Data == null && TextureLoader != null)
+            {
+                try
+                {
+                    Cursor = Cursors.WaitCursor;
+                    TextureLoader(tex);
+                }
+                catch (Exception ex)
+                {
+                    SelTexturePictureBox.Image = null;
+                    SelTextureNameTextBox.Text = tex.Name;
+                    DetailsPropertyGrid.SelectedObject = tex;
+                    UpdateStatus(tex.Name + ": " + ex.Message);
+                    return;
+                }
+                finally { Cursor = Cursors.Default; }
+                foreach (ListViewItem lvi in TexturesListView.Items)
+                    if (lvi.Tag == tex && lvi.SubItems.Count > 1) lvi.SubItems[1].Text = tex.Width + " x " + tex.Height;
+            }
+
 
             if (mipchange)
             {
@@ -153,6 +213,7 @@ namespace CodeWalker.Forms
             {
                 int cmip = Math.Min(Math.Max(mip, 0), tex.Levels - 1);
                 byte[] pixels = DDSIO.GetPixels(tex, cmip);
+                ApplyChannelView(pixels);
                 int w = tex.Width >> cmip;
                 int h = tex.Height >> cmip;
                 Bitmap bmp = new Bitmap(w, h, PixelFormat.Format32bppArgb);
