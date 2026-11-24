@@ -1768,6 +1768,7 @@ namespace CodeWalker
 
                 if (fe is Rpf9FileEntry fe9)
                 {
+                    if ((fe9.NameLower ?? "").EndsWith(".zkit") && ViewGta6Kit(name, path, data, fe9)) return;
                     if (ViewRpf9Meta(name, path, data, fe9)) return;
                     if (ViewRpf9SecMotion(name, path, data, fe9)) return;
                     if (ft.DefaultAction == FileTypeAction.ViewXml && !IsTextXml(data)) { ViewHex(name, path, data); return; } //binary metadata that didn't decode
@@ -2056,6 +2057,7 @@ namespace CodeWalker
             public readonly Dictionary<ulong, Rpf9FileEntry> ByHash = new Dictionary<ulong, Rpf9FileEntry>();      // .zsm/.zdr/.zdd/.zft by RPF9 name hash
             public readonly List<Rpf9FileEntry> AssetMaps = new List<Rpf9FileEntry>();                              // *.zsmam
             public readonly Dictionary<string, Rpf9FileEntry> Fragments = new Dictionary<string, Rpf9FileEntry>(); // *.zft by lowercase name without extension (character rigs)
+            public readonly Dictionary<uint, Rpf9FileEntry> FragmentsByJoaat = new Dictionary<uint, Rpf9FileEntry>(); // *.zft by joaat(lowercase name without extension) (kit "fragment" tags)
             public Dictionary<ulong, ulong[]> SecMotion;          // drawable name hash -> .zsm name hashes (all asset maps merged)
             public Dictionary<ulong, List<ulong>> SecMotionUsers; // .zsm name hash -> drawable name hashes
             public List<string> SecMotionErrors = new List<string>();
@@ -2093,6 +2095,8 @@ namespace CodeWalker
                             {
                                 var key = nl.Substring(0, nl.Length - 4);
                                 if (!res.Fragments.ContainsKey(key)) res.Fragments[key] = fe;
+                                var jh = Rpf9Psin.Joaat(key);
+                                if (!res.FragmentsByJoaat.ContainsKey(jh)) res.FragmentsByJoaat[jh] = fe;
                             }
                         }
                     }
@@ -2240,18 +2244,293 @@ namespace CodeWalker
             for (int i = stem.LastIndexOf('_'); i > 0; i = stem.LastIndexOf('_', i - 1))
             {
                 if (!frags.TryGetValue(stem.Substring(0, i), out var fe) || fe == part) continue;
-                try
-                {
-                    var data = fe.File.ExtractFile(fe);
-                    if (data == null) continue;
-                    var sk = Rpf9Drawable.Read(data, fe.VirtualSize).Select(x => x.Drawable?.Skeleton).FirstOrDefault(s => s != null);
-                    if (sk == null) continue;
-                    rigName = fe.Name;
-                    return sk;
-                }
-                catch (Exception) { }
+                var sk = ReadGta6Rig(fe);
+                if (sk == null) continue;
+                rigName = fe.Name;
+                return sk;
             }
             return null;
+        }
+
+        private Skeleton ReadGta6Rig(Rpf9FileEntry fe)
+        {
+            try
+            {
+                var data = fe?.File?.ExtractFile(fe);
+                return data == null ? null : Rpf9Drawable.ReadSkeletonOnly(data, fe.VirtualSize);
+            }
+            catch (Exception) { return null; }
+        }
+
+        private class Gta6RigInfo { public Rpf9FileEntry Entry; public HashSet<uint> Bones; public int Count; }
+        private List<Gta6RigInfo> gta6Rigs;
+        /// <summary>The bone name hashes of every .zft skeleton in the loaded archives (read once, about 2 s for packs.rpf).</summary>
+        private List<Gta6RigInfo> Gta6Rigs
+        {
+            get
+            {
+                if (gta6Rigs != null) return gta6Rigs;
+                var frags = Gta6Index.Fragments;
+                var list = new List<Gta6RigInfo>();
+                foreach (var fe in frags.Values)
+                {
+                    var sk = ReadGta6Rig(fe);
+                    var hm = Rpf9Drawable.BoneHashMap(sk);
+                    if (hm == null || sk.Bones.Items.Length < 20) continue;
+                    list.Add(new Gta6RigInfo { Entry = fe, Bones = new HashSet<uint>(hm.Keys), Count = sk.Bones.Items.Length });
+                }
+                if (frags.Count > 0) gta6Rigs = list;
+                return list;
+            }
+        }
+
+        /// <summary>
+        /// GTA VI: the rig for meshes that use these bones, when no name says which (hash-named parts, human kits name no
+        /// fragment): the .zft skeleton that has most of them, the smallest one of those. Null unless it has at least half.
+        /// </summary>
+        private Skeleton FindGta6RigByBones(HashSet<uint> used, Rpf9FileEntry exclude, out string rigName)
+        {
+            rigName = null;
+            if (used == null || used.Count == 0) return null;
+            Gta6RigInfo best = null; int bestHits = 0;
+            foreach (var r in Gta6Rigs)
+            {
+                if (r.Entry == exclude) continue;
+                int hits = 0;
+                foreach (var h in used) if (r.Bones.Contains(h)) hits++;
+                if (hits > bestHits || (hits == bestHits && best != null && r.Count < best.Count)) { best = r; bestHits = hits; }
+            }
+            if (best == null || bestHits * 2 < used.Count) return null;
+            var sk = ReadGta6Rig(best.Entry);
+            if (sk != null) rigName = best.Entry.Name + " (best bone match, " + bestHits + "/" + used.Count + ")";
+            return sk;
+        }
+
+        private readonly Dictionary<uint, Rpf9FileEntry> gta6BoneDonor = new Dictionary<uint, Rpf9FileEntry>(); // bone name hash -> a .zdd/.zft whose skeleton has it
+        private readonly HashSet<uint> gta6BoneNoDonor = new HashSet<uint>();                                    // searched everywhere, not found
+        private readonly HashSet<Rpf9FileEntry> gta6BoneScanned = new HashSet<Rpf9FileEntry>();
+
+        /// <summary>
+        /// GTA VI: skeletons that have these bones (garment layer bones a part uses but another part carries, GM_L01_*).
+        /// Reads skeletons of the parts' own archives first, then the rest, until every bone is found or about 20 s pass;
+        /// remembers what it found for later kits.
+        /// </summary>
+        private IList<Skeleton> FindGta6BoneDonors(HashSet<uint> miss, IList<Rpf9FileEntry> near)
+        {
+            var res = new List<Skeleton>();
+            var left = new HashSet<uint>(miss.Where(h => !gta6BoneNoDonor.Contains(h)));
+            var useEntries = new List<Rpf9FileEntry>();
+            foreach (var h in left.ToList())
+                if (gta6BoneDonor.TryGetValue(h, out var de)) { if (!useEntries.Contains(de)) useEntries.Add(de); }
+            void Take(Rpf9FileEntry fe, Skeleton sk)
+            {
+                var hm = Rpf9Drawable.BoneHashMap(sk);
+                if (hm == null) return;
+                bool any = false;
+                foreach (var h in hm.Keys)
+                {
+                    if (!gta6BoneDonor.ContainsKey(h)) gta6BoneDonor[h] = fe;
+                    if (left.Remove(h)) any = true;
+                }
+                if (any) res.Add(sk);
+            }
+            foreach (var de in useEntries) Take(de, ReadGta6Rig(de));
+            if (left.Count == 0) return res;
+
+            var ix = Gta6Index;
+            var nearFiles = new HashSet<RpfFile>(near.Where(x => x?.File != null).Select(x => x.File));
+            var cands = ix.ByHash.Values.Where(x => nearFiles.Contains(x.File))
+                .Concat(ix.ByHash.Values.Where(x => !nearFiles.Contains(x.File)))
+                .Where(x => x.NameLower.EndsWith(".zdd") || x.NameLower.EndsWith(".zft"));
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            bool complete = true;
+            foreach (var fe in cands)
+            {
+                if (left.Count == 0) break;
+                if (sw.ElapsedMilliseconds > 20000) { complete = false; break; }
+                if (!gta6BoneScanned.Add(fe)) continue;
+                var sk = ReadGta6Rig(fe);
+                if (sk == null) continue;
+                Take(fe, sk);
+            }
+            if (complete) gta6BoneNoDonor.UnionWith(left);
+            return res;
+        }
+
+        /// <summary>GTA VI .zdd with no rig by name: the rig by the bones its meshes use that its own skeleton lacks.</summary>
+        private Skeleton FindGta6RigForPart(byte[] data, Rpf9FileEntry part, out string rigName)
+        {
+            rigName = null;
+            if (!(part?.NameLower ?? "").EndsWith(".zdd")) return null;
+            try
+            {
+                var used = Rpf9Drawable.UsedBoneHashes(data, part.VirtualSize);
+                var own = Rpf9Drawable.BoneHashMap(Rpf9Drawable.ReadSkeletonOnly(data, part.VirtualSize));
+                if (own != null && used.All(h => own.ContainsKey(h))) return null;
+                return FindGta6RigByBones(used, part, out rigName);
+            }
+            catch (Exception) { return null; }
+        }
+
+        /// <summary>
+        /// GTA VI character kit (.zkit): pick an outfit and view all its parts as one model on one skeleton. Returns false
+        /// to show the kit as XML instead (asked for, or nothing to show).
+        /// </summary>
+        private bool ViewGta6Kit(string name, string path, byte[] data, Rpf9FileEntry e9)
+        {
+            Rpf9Kit kit;
+            try
+            {
+                Cursor = Cursors.WaitCursor;
+                kit = Rpf9Kit.Read(data, e9);
+            }
+            catch (Exception ex)
+            {
+                UpdateStatus(name + ": kit decode failed (" + ex.Message + "), showing it as metadata");
+                return false;
+            }
+            finally { Cursor = Cursors.Default; }
+            if (kit == null) return false;
+            var ix = Gta6Index;
+            string PartName(Rpf9Kit.Part p) => ix.ByHash.TryGetValue(p.Drawable, out var pe) ? Path.GetFileNameWithoutExtension(pe.Name) : p.NameText;
+            var outfits = new List<Rpf9Kit.Outfit>();
+            var labels = new List<string>();
+            foreach (var o in kit.Outfits)
+            {
+                var ps = kit.Resolve(o, out _);
+                int found = ps.Count(p => ix.ByHash.ContainsKey(p.Drawable));
+                if (found == 0) continue;
+                outfits.Add(o);
+                labels.Add(o.NameText + "  (" + found + " parts: " + string.Join(", ", ps.Where(p => ix.ByHash.ContainsKey(p.Drawable)).Select(PartName)) + ")");
+            }
+            if (outfits.Count == 0) { UpdateStatus(name + ": no outfit with parts in the loaded archives, showing the kit as metadata"); return false; }
+
+            int pick = PickGta6Outfit(name, labels);
+            if (pick == -1) return false;   // XML
+            if (pick < 0) return true;      // cancelled
+            var outfit = outfits[pick];
+            var parts = kit.Resolve(outfit, out uint frag);
+            var notes = new List<string>();
+            Rpf9Drawable.Item item = null;
+            string rigNote = "";
+            var partEntries = new List<Rpf9FileEntry>();
+            Cursor = Cursors.WaitCursor;
+            try
+            {
+                var kps = new List<Rpf9Drawable.KitPart>();
+                foreach (var p in parts)
+                {
+                    if (!ix.ByHash.TryGetValue(p.Drawable, out var pe)) { notes.Add(p.NameText + " not in the loaded archives"); continue; }
+                    var pd = pe.File.ExtractFile(pe);
+                    if (pd == null) { notes.Add("unable to extract " + pe.Name); continue; }
+                    kps.Add(new Rpf9Drawable.KitPart { Name = pe.Name, Data = pd, VirtualSize = pe.VirtualSize, TextureSwaps = kit.TextureSwaps(p) });
+                    partEntries.Add(pe);
+                }
+                Skeleton rig = null; string rigName = null;
+                if (frag != 0 && ix.FragmentsByJoaat.TryGetValue(frag, out var fe))
+                {
+                    rig = ReadGta6Rig(fe);
+                    if (rig != null) rigName = fe.Name;
+                }
+                if (rig == null)
+                {
+                    var used = new HashSet<uint>();
+                    foreach (var kp in kps) { try { used.UnionWith(Rpf9Drawable.UsedBoneHashes(kp.Data, kp.VirtualSize)); } catch (Exception) { } }
+                    rig = FindGta6RigByBones(used, null, out rigName);
+                }
+                item = Rpf9Drawable.ReadKit(Path.GetFileNameWithoutExtension(name) + " " + outfit.NameText, kps, rig, notes,
+                    miss => FindGta6BoneDonors(miss, partEntries));
+                rigNote = rig != null ? ", on rig " + rigName : ", no rig found";
+                if (item != null && item.MissingBones > 0) rigNote += " (" + item.MissingBones + " bones the meshes name aren't in the skeleton)";
+            }
+            finally { Cursor = Cursors.Default; }
+            if (item == null)
+            {
+                MessageBox.Show("None of the outfit's parts decoded." + (notes.Count > 0 ? "\n" + string.Join("\n", notes.Take(5)) : ""), name);
+                return true;
+            }
+            ShowGta6Model(name, e9, new List<Rpf9Drawable.Item> { item }, notes, ", outfit " + outfit.NameText + " (" + partEntries.Count + " parts)" + rigNote, partEntries);
+            return true;
+        }
+
+        /// <summary>Outfit chooser: index into labels, -1 = show as XML, -2 = cancelled.</summary>
+        private int PickGta6Outfit(string title, List<string> labels)
+        {
+            using (var f = new Form())
+            {
+                f.Text = title + ": pick an outfit";
+                f.StartPosition = FormStartPosition.CenterParent;
+                f.Size = new System.Drawing.Size(900, 420);
+                f.MinimizeBox = false; f.MaximizeBox = false; f.ShowIcon = false; f.ShowInTaskbar = false;
+                var list = new ListBox { Dock = DockStyle.Fill, IntegralHeight = false, HorizontalScrollbar = true };
+                foreach (var l in labels) list.Items.Add(l);
+                list.SelectedIndex = 0;
+                var panel = new FlowLayoutPanel { Dock = DockStyle.Bottom, FlowDirection = FlowDirection.RightToLeft, Height = 36, Padding = new Padding(4) };
+                var ok = new Button { Text = "View model", DialogResult = DialogResult.OK, AutoSize = true };
+                var xml = new Button { Text = "Show XML", DialogResult = DialogResult.Retry, AutoSize = true };
+                var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, AutoSize = true };
+                panel.Controls.Add(cancel); panel.Controls.Add(xml); panel.Controls.Add(ok);
+                f.Controls.Add(list); f.Controls.Add(panel);
+                f.AcceptButton = ok; f.CancelButton = cancel;
+                list.DoubleClick += (s, e) => { f.DialogResult = DialogResult.OK; f.Close(); };
+                var r = f.ShowDialog(this);
+                if (r == DialogResult.Retry) return -1;
+                if (r != DialogResult.OK || list.SelectedIndex < 0) return -2;
+                return list.SelectedIndex;
+            }
+        }
+
+        /// <summary>GTA VI drawables in the model viewer: textures, clip dictionaries, secondary motion of the source entries, status line.</summary>
+        private void ShowGta6Model(string name, RpfFileEntry e, List<Rpf9Drawable.Item> items, List<string> notes, string rigNote, List<Rpf9FileEntry> secMotionSources)
+        {
+            int textured = 0, texShaders = 0;
+            string texNote = "";
+            Cursor = Cursors.WaitCursor;
+            try
+            {
+                var store = Gta6Textures;
+                if (store != null && store.KeyCount > 0)
+                {
+                    int errs = store.Errors.Count;
+                    textured = store.Apply(items);
+                    if (store.Errors.Count > errs) texNote = "; texture errors: " + string.Join("; ", store.Errors.Skip(errs).Take(2));
+                }
+                else texNote = "; no TTDB texture packs (*.ttpf) found";
+            }
+            catch (Exception ex) { texNote = "; textures failed: " + ex.Message; }
+            finally { Cursor = Cursors.Default; }
+            texShaders = items.Sum(i => i.TexRefs.Select(t => t.Shader).Distinct().Count());
+            var gf = Rpf9Drawable.ToGameFile(name, e, items);
+            if (gf == null)
+            {
+                MessageBox.Show("No drawable this version understands." + (notes.Count > 0 ? "\n" + string.Join("\n", notes.Take(5)) : ""), name);
+                return;
+            }
+            ModelForm f9 = new ModelForm(this);
+            f9.Show();
+            if (gf is YdrFile ydr9) f9.LoadModel(ydr9);
+            else if (gf is YddFile ydd9) f9.LoadModels(ydd9);
+            int nbones = items.Max(i => i.Bones);
+            string animNote = "";
+            if (nbones > 0)
+            {
+                var clipDicts = Gta6ClipDicts;
+                if (clipDicts.Count > 0) f9.SetGta6Clips(clipDicts.Keys, LoadGta6ClipDict);
+                animNote = ", " + nbones + " bones" + rigNote + (clipDicts.Count > 0 ? " (type a clip dictionary name to play clips)" : " (no .zcd clip dictionaries loaded)");
+            }
+            else animNote = rigNote;
+            var smNotes = new List<string>();
+            var secMotion = new List<KeyValuePair<string, Rpf9SecMotion.Zsm>>();
+            foreach (var src in secMotionSources) secMotion.AddRange(LoadGta6SecMotion(src, smNotes));
+            if (secMotion.Count > 0)
+            {
+                int bound = f9.SetGta6SecMotion(secMotion);
+                animNote += ", " + secMotion.Count + " secondary motion (" + string.Join(", ", secMotion.GroupBy(z => z.Value.Type).OrderBy(g => g.Key).Select(g => g.Count() + " " + Rpf9SecMotion.Zsm.TypeName(g.Key)))
+                    + (bound < secMotion.Count ? "; " + (secMotion.Count - bound) + " with no matching bones" : "") + ")";
+            }
+            if (smNotes.Count > 0) notes.AddRange(smNotes);
+            int ntri = items.Sum(i => i.Triangles);
+            UpdateStatus(name + ": " + items.Count + " drawable(s), " + ntri.ToString("N0") + " triangles" + animNote + ", " + textured + "/" + texShaders + " shaders textured" + texNote + (notes.Count > 0 ? "; " + notes.Count + " notes: " + string.Join("; ", notes.Take(3)) : ""));
         }
 
         private void ViewModel(string name, string path, byte[] data, RpfFileEntry e)
@@ -2261,62 +2540,25 @@ namespace CodeWalker
                 //GTA VI drawable / drawable dictionary / fragment
                 var notes = new List<string>();
                 List<Rpf9Drawable.Item> items;
+                string rigNote = "";
                 Cursor = Cursors.WaitCursor;
-                int textured = 0, texShaders = 0;
-                string texNote = "", rigNote = "";
                 try
                 {
-                    var rig = LoadGta6Rig(e9, out string rigName);
+                    var rig = LoadGta6Rig(e9, out string rigName) ?? FindGta6RigForPart(data, e9, out rigName);
                     items = Rpf9Drawable.Read(data, e9.VirtualSize, notes, rig);
                     if (items.Any(i => i.RigUse == 2)) rigNote = ", own skeleton attached to rig " + rigName;
                     else if (items.Any(i => i.RigUse == 1)) rigNote = ", skinned to rig " + rigName;
                     int miss = items.Sum(i => i.MissingBones);
-                    if (miss > 0) rigNote += " (" + miss + " bones the mesh names aren't in the skeleton)";
-                    try
-                    {
-                        var store = Gta6Textures;
-                        if (store != null && store.KeyCount > 0)
-                        {
-                            int errs = store.Errors.Count;
-                            textured = store.Apply(items);
-                            if (store.Errors.Count > errs) texNote = "; texture errors: " + string.Join("; ", store.Errors.Skip(errs).Take(2));
-                        }
-                        else texNote = "; no TTDB texture packs (*.ttpf) found";
-                    }
-                    catch (Exception ex) { texNote = "; textures failed: " + ex.Message; }
-                    texShaders = items.Sum(i => i.TexRefs.Select(t => t.Shader).Distinct().Count());
+                    if (miss > 0) rigNote += " (" + miss + " bones the mesh names aren't in the skeleton; open the character's .zkit for the whole outfit)";
                 }
                 finally { Cursor = Cursors.Default; }
-                var gf = Rpf9Drawable.ToGameFile(name, e, items);
-                if (gf == null)
+                if (items.Count == 0)
                 {
                     MessageBox.Show("No drawable this version understands." + (notes.Count > 0 ? "\n" + string.Join("\n", notes.Take(5)) : ""), name);
                     ViewHex(name, path, data);
                     return;
                 }
-                ModelForm f9 = new ModelForm(this);
-                f9.Show();
-                if (gf is YdrFile ydr9) f9.LoadModel(ydr9);
-                else if (gf is YddFile ydd9) f9.LoadModels(ydd9);
-                int nbones = items.Max(i => i.Bones);
-                string animNote = "";
-                if (nbones > 0)
-                {
-                    var clipDicts = Gta6ClipDicts;
-                    if (clipDicts.Count > 0) f9.SetGta6Clips(clipDicts.Keys, LoadGta6ClipDict);
-                    animNote = ", " + nbones + " bones" + rigNote + (clipDicts.Count > 0 ? " (type a clip dictionary name to play clips)" : " (no .zcd clip dictionaries loaded)");
-                }
-                var smNotes = new List<string>();
-                var secMotion = LoadGta6SecMotion(e9, smNotes);
-                if (secMotion.Count > 0)
-                {
-                    int bound = f9.SetGta6SecMotion(secMotion);
-                    animNote += ", " + secMotion.Count + " secondary motion (" + string.Join(", ", secMotion.GroupBy(z => z.Value.Type).OrderBy(g => g.Key).Select(g => g.Count() + " " + Rpf9SecMotion.Zsm.TypeName(g.Key)))
-                        + (bound < secMotion.Count ? "; " + (secMotion.Count - bound) + " with no matching bones" : "") + ")";
-                }
-                if (smNotes.Count > 0) notes.AddRange(smNotes);
-                int ntri = items.Sum(i => i.Triangles);
-                UpdateStatus(name + ": " + items.Count + " drawable(s), " + ntri.ToString("N0") + " triangles" + animNote + ", " + textured + "/" + texShaders + " shaders textured" + texNote + (notes.Count > 0 ? "; " + notes.Count + " skipped: " + string.Join("; ", notes.Take(3)) : ""));
+                ShowGta6Model(name, e, items, notes, rigNote, new List<Rpf9FileEntry> { e9 });
                 return;
             }
             var nl = e?.NameLower ?? "";
