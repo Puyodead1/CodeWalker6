@@ -76,6 +76,49 @@ namespace CodeWalker.GameFiles
             }
         }
 
+        static bool IsWeaponShader(uint h) => h == 0xe68a4a98 /* weapon */ || h == 0x348b6795 /* weapon_muv_alpha */;
+
+        readonly Dictionary<ulong, Texture> grey = new Dictionary<ulong, Texture>();
+
+        /// <summary>The green channel of a texture as an opaque grey BGRA8 texture with a box-filtered mip chain (cached).</summary>
+        Texture GreyFromGreen(ulong key)
+        {
+            lock (this)
+            {
+                if (grey.TryGetValue(key, out var g)) return g;
+                g = null;
+                var t = Get(key);
+                byte[] px = null;
+                try { px = t != null ? DDSIO.GetPixels(t, 0) : null; } catch (Exception ex) { Errors.Add(key.ToString("x16") + ": " + ex.Message); }
+                if (px != null && px.Length >= t.Width * t.Height * 4)
+                {
+                    int w = t.Width, h = t.Height;
+                    var lum = new byte[w * h];
+                    for (int i = 0; i < lum.Length; i++) lum[i] = px[4 * i + 1];
+                    var chain = new List<byte[]>();
+                    while (true)
+                    {
+                        var m = new byte[w * h * 4];
+                        for (int i = 0; i < w * h; i++) { m[4 * i] = m[4 * i + 1] = m[4 * i + 2] = lum[i]; m[4 * i + 3] = 255; }
+                        chain.Add(m);
+                        if (w == 1 && h == 1) break;
+                        int nw = Math.Max(1, w / 2), nh = Math.Max(1, h / 2);
+                        var nl = new byte[nw * nh];
+                        for (int y = 0; y < nh; y++)
+                            for (int x = 0; x < nw; x++)
+                            {
+                                int x0 = Math.Min(2 * x, w - 1), x1 = Math.Min(2 * x + 1, w - 1), y0 = Math.Min(2 * y, h - 1), y1 = Math.Min(2 * y + 1, h - 1);
+                                nl[y * nw + x] = (byte)((lum[y0 * w + x0] + lum[y0 * w + x1] + lum[y1 * w + x0] + lum[y1 * w + x1] + 2) / 4);
+                            }
+                        lum = nl; w = nw; h = nh;
+                    }
+                    g = Rpf9Texture.MakeTexture(key.ToString("x16") + "_grey", t.Width, t.Height, 87, chain); // 87 = B8G8R8A8_UNORM
+                }
+                grey[key] = g;
+                return g;
+            }
+        }
+
         /// <summary>average of a small mip is the flat-normal blue (0.5, 0.5, 1)</summary>
         bool LooksLikeNormal(Rpf9Ttdb p, ulong key, Rpf9Ttdb.Record r)
         {
@@ -122,22 +165,27 @@ namespace CodeWalker.GameFiles
                         if (k == 1 && diff == 0) diff = tr.Key;
                         else if (k == 2 && bump == 0) bump = tr.Key;
                     }
+                    var sh = shaders[kv.Key];
                     var pars = new List<ShaderParameter>();
                     var names = new List<MetaName>();
-                    void Add(ulong key, ShaderParamNames name)
+                    void AddTex(Texture t, ShaderParamNames name)
                     {
-                        if (key == 0) return;
-                        var t = Get(key);
                         if (t == null) return;
                         pars.Add(new ShaderParameter { DataType = 0, Data = t });
                         names.Add((MetaName)(uint)name);
                         if (!used.Contains(t)) used.Add(t);
                     }
-                    Add(diff, ShaderParamNames.DiffuseSampler);
-                    Add(bump, ShaderParamNames.BumpSampler);
+                    if (diff != 0) AddTex(Get(diff), ShaderParamNames.DiffuseSampler);
+                    else if (IsWeaponShader((uint)sh.Name))
+                    {
+                        // weapon shader: slot 0 is a packed, tintable base (G = grey albedo, B = tint mask); the
+                        // colour comes from a tint palette we don't have, so show the grey albedo
+                        foreach (var tr in kv.Value)
+                            if (Kind(tr.Key) == 0) { AddTex(GreyFromGreen(tr.Key), ShaderParamNames.DiffuseSampler); break; }
+                    }
+                    if (bump != 0) AddTex(Get(bump), ShaderParamNames.BumpSampler);
                     if (pars.Count == 0) continue;
                     if (names.Contains((MetaName)(uint)ShaderParamNames.DiffuseSampler)) textured++;
-                    var sh = shaders[kv.Key];
                     sh.ParametersList = new ShaderParametersBlock { Parameters = pars.ToArray(), Hashes = names.ToArray(), Owner = sh };
                 }
                 if (used.Count > 0)
