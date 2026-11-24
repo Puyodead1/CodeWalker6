@@ -392,7 +392,7 @@ namespace CodeWalker
             InitFileType(".zbdd", "Drawable Dictionary (ZBDD)", 12);
             InitFileType(".zbft", "Fragment (ZBFT)", 11);
             InitFileType(".zvert", "Vertex Data", 9);
-            InitFileType(".zcd", "Clip Dictionary", 18);
+            InitFileType(".zcd", "Clip Dictionary", 18, FileTypeAction.ViewYcd);
             InitFileType(".zld", "Cloth Dictionary", 9);
             InitFileType(".zpmd", "Parameterized Motion Dictionary", 18);
             InitFileType(".zpm", "Parameterized Motion", 18);
@@ -2046,6 +2046,62 @@ namespace CodeWalker
             }
         }
 
+        private Dictionary<string, Rpf9FileEntry> gta6ClipDicts;
+        private readonly List<KeyValuePair<string, Rpf9Anim.Dict>> gta6ClipCache = new List<KeyValuePair<string, Rpf9Anim.Dict>>();
+        /// <summary>GTA VI clip dictionaries (*.zcd) in the loaded archives, by lowercase name without extension.</summary>
+        private Dictionary<string, Rpf9FileEntry> Gta6ClipDicts
+        {
+            get
+            {
+                if (gta6ClipDicts != null) return gta6ClipDicts;
+                var res = new Dictionary<string, Rpf9FileEntry>();
+                var rpfs = AllRpfs;
+                if (rpfs == null) return res; // not loaded yet, try again next time
+                var seen = new HashSet<RpfFile>();
+                var stack = new Stack<RpfFile>(rpfs);
+                while (stack.Count > 0)
+                {
+                    var rpf = stack.Pop();
+                    if (rpf == null || !seen.Add(rpf)) continue;
+                    if (rpf.Children != null) foreach (var c in rpf.Children) stack.Push(c);
+                    if (rpf.AllEntries == null) continue;
+                    foreach (var fe in rpf.AllEntries.OfType<Rpf9FileEntry>())
+                    {
+                        if (!fe.NameLower.EndsWith(".zcd")) continue;
+                        var key = fe.NameLower.Substring(0, fe.NameLower.Length - 4);
+                        if (!res.ContainsKey(key)) res[key] = fe;
+                    }
+                }
+                gta6ClipDicts = res;
+                return res;
+            }
+        }
+        /// <summary>ModelForm callback: GTA VI clip dictionary bound to the viewed skeleton (decoded dictionaries are cached).</summary>
+        private YcdFile LoadGta6ClipDict(string name, Skeleton skel, out string note)
+        {
+            note = null;
+            if (!Gta6ClipDicts.TryGetValue(name, out var fe)) return null;
+            Rpf9Anim.Dict dict = null;
+            int ci = gta6ClipCache.FindIndex(kv => kv.Key == name);
+            if (ci >= 0)
+            {
+                dict = gta6ClipCache[ci].Value;
+                gta6ClipCache.RemoveAt(ci);
+            }
+            else
+            {
+                var data = fe.File.ExtractFile(fe);
+                if (data == null) { note = "unable to extract " + fe.Path; return null; }
+                dict = Rpf9Anim.Read(data, fe.VirtualSize);
+            }
+            gta6ClipCache.Add(new KeyValuePair<string, Rpf9Anim.Dict>(name, dict));
+            if (gta6ClipCache.Count > 16) gta6ClipCache.RemoveAt(0);
+            var ycd = Rpf9Anim.ToYcd(dict, name, Rpf9Drawable.BoneHashMap(skel), out int matched, out int total);
+            note = name + ": " + ycd.ClipMapEntries.Length + " clips, " + matched + "/" + total + " bone tracks match this skeleton"
+                + (dict.Failed > 0 ? ", " + dict.Failed + " animations failed to decode" : "");
+            return ycd;
+        }
+
         private void ViewModel(string name, string path, byte[] data, RpfFileEntry e)
         {
             if (e is Rpf9FileEntry e9)
@@ -2085,8 +2141,16 @@ namespace CodeWalker
                 f9.Show();
                 if (gf is YdrFile ydr9) f9.LoadModel(ydr9);
                 else if (gf is YddFile ydd9) f9.LoadModels(ydd9);
+                int nbones = items.Max(i => i.Bones);
+                string animNote = "";
+                if (nbones > 0)
+                {
+                    var clipDicts = Gta6ClipDicts;
+                    if (clipDicts.Count > 0) f9.SetGta6Clips(clipDicts.Keys, LoadGta6ClipDict);
+                    animNote = ", " + nbones + " bones" + (clipDicts.Count > 0 ? " (type a clip dictionary name to play clips)" : " (no .zcd clip dictionaries loaded)");
+                }
                 int ntri = items.Sum(i => i.Triangles);
-                UpdateStatus(name + ": " + items.Count + " drawable(s), " + ntri.ToString("N0") + " triangles, " + textured + "/" + texShaders + " shaders textured" + texNote + (notes.Count > 0 ? "; " + notes.Count + " skipped: " + string.Join("; ", notes.Take(3)) : ""));
+                UpdateStatus(name + ": " + items.Count + " drawable(s), " + ntri.ToString("N0") + " triangles" + animNote + ", " + textured + "/" + texShaders + " shaders textured" + texNote + (notes.Count > 0 ? "; " + notes.Count + " skipped: " + string.Join("; ", notes.Take(3)) : ""));
                 return;
             }
             var nl = e?.NameLower ?? "";
@@ -2172,6 +2236,19 @@ namespace CodeWalker
         }
         private void ViewYcd(string name, string path, byte[] data, RpfFileEntry e)
         {
+            if (e is Rpf9FileEntry e9)
+            {
+                //GTA VI clip dictionary: text summary (clips play in the model viewer, on a drawable with a skeleton)
+                string txt;
+                Cursor = Cursors.WaitCursor;
+                try { txt = Rpf9Anim.Summary(Rpf9Anim.Read(data, e9.VirtualSize)); }
+                catch (Exception ex) { txt = "Not a clip dictionary this version understands: " + ex.Message; }
+                finally { Cursor = Cursors.Default; }
+                TextForm tf = new TextForm(this);
+                tf.Show();
+                tf.LoadReadOnlyText(name + ".txt", path, txt);
+                return;
+            }
             var ycd = RpfFile.GetFile<YcdFile>(e, data);
             YcdForm f = new YcdForm();
             f.Show();

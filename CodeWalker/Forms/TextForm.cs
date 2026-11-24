@@ -73,6 +73,12 @@ namespace CodeWalker.Forms
             rpfFileEntry = e;
             modified = false;
         }
+        /// <summary>Generated, view-only text (e.g. a GTA VI file summary): no editing.</summary>
+        public void LoadReadOnlyText(string filename, string filepath, string text)
+        {
+            LoadText(filename, filepath, text, null);
+            MainTextBox.ReadOnly = true;
+        }
         public void LoadGxt2(string filename, string filepath, Gxt2File gxt)
         {
             fileType = TextFileType.GXT2;

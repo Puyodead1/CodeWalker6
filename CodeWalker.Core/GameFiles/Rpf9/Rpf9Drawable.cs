@@ -9,8 +9,8 @@ namespace CodeWalker.GameFiles
     /// <summary>
     /// GTA VI (RPF9 gen9 Xbox) drawables, drawable dictionaries and fragments -> CodeWalker Drawable objects
     /// for the model viewer. Port of rsc_mesh.py (see that file for the format notes).
-    /// Geometry only for now: positions, normals, tangents, colour, uv0. Skinned meshes are shown in their
-    /// bind pose (no skeleton), textures are not resolved yet (shader names only).
+    /// Positions, normals, tangents, colour, uv0, and the skeleton with blend weights/indices when the drawable
+    /// has one (all its models are then skin meshes, so clips from <see cref="Rpf9Anim"/> can pose them).
     /// </summary>
     public static class Rpf9Drawable
     {
@@ -28,6 +28,7 @@ namespace CodeWalker.GameFiles
             public uint Hash;         // dictionary hash (0 when not a dictionary item)
             public Drawable Drawable;
             public int Triangles;
+            public int Bones;         // skeleton bone count, 0 without a skeleton
             public List<TexRef> TexRefs = new List<TexRef>();
         }
 
@@ -40,6 +41,8 @@ namespace CodeWalker.GameFiles
             public float[] Tangents;    // 4 per vertex or null
             public float[] Uv0;         // 2 per vertex or null
             public uint[] Colours;      // RGBA8 or null
+            public byte[] Weights;      // 4 per vertex (unorm) or null
+            public byte[] Joints;       // 4 per vertex (skeleton bone indices) or null
             public int[] Indices;       // 3 per triangle
             public int Shader;
         }
@@ -252,6 +255,16 @@ namespace CodeWalker.GameFiles
                     m.Colours = new uint[nv];
                     Buffer.BlockCopy(g, p, m.Colours, 0, 4 * nv);
                 }
+                else if (slot == 6 && fm == 0x26)
+                {
+                    m.Weights = new byte[4 * nv];
+                    Buffer.BlockCopy(g, p, m.Weights, 0, 4 * nv);
+                }
+                else if (slot == 8 && fm == 0x25)
+                {
+                    m.Joints = new byte[4 * nv];
+                    Buffer.BlockCopy(g, p, m.Joints, 0, 4 * nv);
+                }
             }
             return m;
         }
@@ -409,9 +422,87 @@ namespace CodeWalker.GameFiles
             return sh;
         }
 
+        // ------------------------------------------------------------------ skeleton
+
+        static readonly System.Runtime.CompilerServices.ConditionalWeakTable<Skeleton, Dictionary<uint, ushort>> boneHashes =
+            new System.Runtime.CompilerServices.ConditionalWeakTable<Skeleton, Dictionary<uint, ushort>>();
+
+        /// <summary>
+        /// Skeleton at drawable +0x18 as a CodeWalker Skeleton, or null. Bone.Tag = bone index (GTA VI animations
+        /// address bones by joaat(name), see <see cref="BoneHashMap"/>). Layout: +0x28 bones (0x50 each),
+        /// +0x30 inverse bind matrices (16 f32, column-major), +0x40 i16 parents, +0x6c u16 count.
+        /// Bone: +0 quat, +0x10 translation, +0x1c joaat(name), +0x20 scale, +0x30 name ptr.
+        /// </summary>
+        static Skeleton ReadSkeleton(Res r, long root)
+        {
+            long sk = r.CPtr(root + 0x18);
+            if (sk < 0 || sk + 0x70 > r.C.Length) return null;
+            int n = r.U16(sk + 0x6c);
+            long ba = r.CPtr(sk + 0x28), ib = r.CPtr(sk + 0x30), pa = r.CPtr(sk + 0x40);
+            if (n == 0 || ba < 0 || ib < 0 || pa < 0 || ba + 0x50L * n > r.C.Length || ib + 0x40L * n > r.C.Length || pa + 2L * n > r.C.Length)
+                return null;
+            float F(long o) => BitConverter.ToSingle(r.C, (int)o);
+            var bones = new Bone[n];
+            var parents = new short[n];
+            var inv = new Matrix[n];
+            var hashes = new Dictionary<uint, ushort>();
+            for (int i = 0; i < n; i++)
+            {
+                long b = ba + 0x50L * i;
+                short par = BitConverter.ToInt16(r.C, (int)(pa + 2 * i));
+                if (par >= i) return null;
+                parents[i] = par;
+                string name = r.CStr(r.CPtr(b + 0x30)) ?? ("bone" + i);
+                var bone = new Bone
+                {
+                    Rotation = new Quaternion(F(b), F(b + 4), F(b + 8), F(b + 12)),
+                    Translation = new Vector3(F(b + 0x10), F(b + 0x14), F(b + 0x18)),
+                    Scale = new Vector3(F(b + 0x20), F(b + 0x24), F(b + 0x28)),
+                    Index = (short)i,
+                    Tag = (ushort)i,
+                    ParentIndex = par,
+                    NextSiblingIndex = -1,
+                    Name = name,
+                };
+                bone.AnimRotation = bone.Rotation;
+                bone.AnimTranslation = bone.Translation;
+                bone.AnimScale = bone.Scale;
+                bones[i] = bone;
+                uint h = r.U32(b + 0x1c);
+                if (h != 0 && !hashes.ContainsKey(h)) hashes[h] = (ushort)i;
+                uint hn = JenkHash.GenHash(name.ToLowerInvariant());
+                if (!hashes.ContainsKey(hn)) hashes[hn] = (ushort)i;
+                // stored column-major for column vectors = row-major for SharpDX's row vectors
+                long m = ib + 0x40L * i;
+                var mx = new Matrix();
+                for (int k = 0; k < 16; k++) mx[k] = F(m + 4 * k);
+                mx.M14 = 0; mx.M24 = 0; mx.M34 = 0; mx.M44 = 1;
+                inv[i] = mx;
+            }
+            var skel = new Skeleton
+            {
+                Bones = new SkeletonBonesBlock { Items = bones, Count = (uint)n },
+                ParentIndices = parents,
+                TransformationsInverted = inv,
+                BonesCount = (ushort)n,
+            };
+            skel.AssignBoneParents();
+            skel.BuildBonesMap();
+            boneHashes.Add(skel, hashes);
+            return skel;
+        }
+
+        /// <summary>joaat(bone name) -> Bone.Tag for a skeleton read from a GTA VI drawable (null for other skeletons).</summary>
+        public static Dictionary<uint, ushort> BoneHashMap(Skeleton skel)
+        {
+            if (skel == null) return null;
+            return boneHashes.TryGetValue(skel, out var m) ? m : null;
+        }
+
         // ------------------------------------------------------------------ CodeWalker objects
 
         const int STRIDE = 52; // VertexType.DefaultEx: pos f3, normal f3, colour u32, uv0 f2, tangent f4
+        const int STRIDE_SKIN = 60; // VertexType.PBBNCTX: pos f3, weights u32, indices u32, normal f3, colour u32, uv0 f2, tangent f4
 
         static VertexDeclaration DeclDefaultEx() => new VertexDeclaration
         {
@@ -420,6 +511,41 @@ namespace CodeWalker.GameFiles
             Count = 5,
             Types = VertexDeclarationTypes.GTAV1,
         };
+
+        static VertexDeclaration DeclSkin() => new VertexDeclaration
+        {
+            Flags = (uint)VertexType.PBBNCTX,
+            Stride = STRIDE_SKIN,
+            Count = 7,
+            Types = VertexDeclarationTypes.GTAV1,
+        };
+
+        /// <summary>Make the mesh's blend data usable for a skeleton of nbones bones: weights summing to 255 and
+        /// indices in range (the renderer's bone buffer holds 255 matrices); bone 0 when there is none.</summary>
+        static void FixSkin(Mesh m, int nbones)
+        {
+            int nv = m.VertexCount;
+            bool ok = m.Weights != null && m.Joints != null;
+            if (ok) foreach (var j in m.Joints) if (j >= nbones) { ok = false; break; }
+            if (!ok)
+            {
+                m.Weights = new byte[4 * nv];
+                m.Joints = new byte[4 * nv];
+                for (int v = 0; v < nv; v++) m.Weights[4 * v] = 255;
+                return;
+            }
+            for (int v = 0; v < nv; v++)
+            {
+                int sum = 0, big = 0;
+                for (int k = 0; k < 4; k++)
+                {
+                    sum += m.Weights[4 * v + k];
+                    if (m.Weights[4 * v + k] > m.Weights[4 * v + big]) big = k;
+                    if (m.Joints[4 * v + k] > 254) m.Joints[4 * v + k] = 254;
+                }
+                m.Weights[4 * v + big] = (byte)Math.Max(0, Math.Min(255, m.Weights[4 * v + big] + 255 - sum));
+            }
+        }
 
         /// <summary>Split a mesh into DrawableGeometries of at most 65535 vertices (ushort indices).</summary>
         static void AddGeometries(Mesh m, ShaderFX shader, List<DrawableGeometry> geoms, List<AABB_s> bounds)
@@ -454,16 +580,24 @@ namespace CodeWalker.GameFiles
         static DrawableGeometry MakeGeometry(Mesh m, List<int> verts, ushort[] indices, ShaderFX shader, out AABB_s bb)
         {
             int n = verts.Count;
-            var vb = new byte[n * STRIDE];
+            bool skin = m.Weights != null && m.Joints != null;
+            int stride = skin ? STRIDE_SKIN : STRIDE;
+            var vb = new byte[n * stride];
             var mn = new Vector3(float.MaxValue);
             var mx = new Vector3(float.MinValue);
             for (int i = 0; i < n; i++)
             {
-                int v = verts[i], o = i * STRIDE;
+                int v = verts[i], o = i * stride;
                 float px = m.Positions[3 * v], py = m.Positions[3 * v + 1], pz = m.Positions[3 * v + 2];
                 Put(vb, o, px); Put(vb, o + 4, py); Put(vb, o + 8, pz);
                 mn = Vector3.Min(mn, new Vector3(px, py, pz));
                 mx = Vector3.Max(mx, new Vector3(px, py, pz));
+                if (skin)
+                {
+                    Buffer.BlockCopy(m.Weights, 4 * v, vb, o + 12, 4);
+                    Buffer.BlockCopy(m.Joints, 4 * v, vb, o + 16, 4);
+                    o += 8; // the rest is laid out as DefaultEx
+                }
                 if (m.Normals != null) { Put(vb, o + 12, m.Normals[3 * v]); Put(vb, o + 16, m.Normals[3 * v + 1]); Put(vb, o + 20, m.Normals[3 * v + 2]); }
                 else Put(vb, o + 20, 1f);
                 uint col = m.Colours != null ? m.Colours[v] : 0xffffffff;
@@ -477,24 +611,24 @@ namespace CodeWalker.GameFiles
                 else { Put(vb, o + 36, 1f); Put(vb, o + 48, 1f); }
             }
             bb = new AABB_s { Min = new Vector4(mn, 0), Max = new Vector4(mx, 0) };
-            var decl = DeclDefaultEx();
+            var decl = skin ? DeclSkin() : DeclDefaultEx();
             var vd = new VertexData
             {
-                VertexStride = STRIDE,
+                VertexStride = stride,
                 VertexCount = n,
                 Info = decl,
-                VertexType = VertexType.DefaultEx,
+                VertexType = skin ? VertexType.PBBNCTX : VertexType.DefaultEx,
                 VertexBytes = vb,
             };
             var g = new DrawableGeometry
             {
                 VertexData = vd,
-                VertexBuffer = new VertexBuffer { VertexStride = STRIDE, VertexCount = (uint)n, Info = decl, Data1 = vd },
+                VertexBuffer = new VertexBuffer { VertexStride = (ushort)stride, VertexCount = (uint)n, Info = decl, Data1 = vd },
                 IndexBuffer = new IndexBuffer { Indices = indices, IndicesCount = (uint)indices.Length },
                 IndicesCount = (uint)indices.Length,
                 TrianglesCount = (uint)(indices.Length / 3),
                 VerticesCount = (ushort)n,
-                VertexStride = STRIDE,
+                VertexStride = (ushort)stride,
                 Shader = shader,
                 AABB = bb,
             };
@@ -535,9 +669,16 @@ namespace CodeWalker.GameFiles
         static Drawable Build(Res r, Item it)
         {
             var meshes = Meshes(r, it.Root);
+            var skel = ReadSkeleton(r, it.Root);
+            int nbones = skel?.Bones?.Items?.Length ?? 0;
             int maxShader = 0;
             foreach (var lod in meshes)
-                if (lod != null) foreach (var mdl in lod) foreach (var m in mdl) maxShader = Math.Max(maxShader, m.Shader + 1);
+                if (lod != null) foreach (var mdl in lod) foreach (var m in mdl)
+                        {
+                            maxShader = Math.Max(maxShader, m.Shader + 1);
+                            if (nbones > 0) FixSkin(m, nbones);
+                            else { m.Weights = null; m.Joints = null; }
+                        }
             var shaders = Shaders(r, it.Root, maxShader, it.TexRefs);
 
             var d = new Drawable
@@ -585,7 +726,7 @@ namespace CodeWalker.GameFiles
                         GeometriesCount3 = (ushort)geoms.Count,
                         ShaderMapping = shaderMap,
                         BoundsData = bounds.ToArray(),
-                        SkeletonBinding = 0,
+                        SkeletonBinding = nbones > 0 ? 0x100u : 0u, // skin mesh, bone 0
                         RenderMaskFlags = 0x00FF,
                     });
                 }
@@ -605,6 +746,8 @@ namespace CodeWalker.GameFiles
             foreach (var mdl in dm.High) foreach (var bb in mdl.BoundsData) { bmin = Vector3.Min(bmin, bb.Min.XYZ()); bmax = Vector3.Max(bmax, bb.Max.XYZ()); }
             d.DrawableModels = dm;
             d.AllModels = all.ToArray();
+            d.Skeleton = skel;
+            it.Bones = nbones;
             d.BoundingBoxMin = bmin;
             d.BoundingBoxMax = bmax;
             d.BoundingCenter = (bmin + bmax) * 0.5f;

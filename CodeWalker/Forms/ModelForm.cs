@@ -984,8 +984,63 @@ namespace CodeWalker.Forms
 
 
 
+        /// <summary>Loads a GTA VI clip dictionary bound to the given skeleton; note = status text.</summary>
+        public delegate YcdFile Gta6ClipLoader(string name, Skeleton skeleton, out string note);
+        private Gta6ClipLoader gta6ClipLoader;
+        private HashSet<string> gta6ClipNames;
+
+        /// <summary>GTA VI: clip dictionaries offered in the clip dictionary box (the game file cache isn't used for GTA VI).</summary>
+        public void SetGta6Clips(IEnumerable<string> names, Gta6ClipLoader loader)
+        {
+            gta6ClipLoader = loader;
+            gta6ClipNames = new HashSet<string>(names);
+            var arr = gta6ClipNames.ToArray();
+            Array.Sort(arr, StringComparer.Ordinal);
+            ClipDictComboBox.AutoCompleteCustomSource.Clear();
+            ClipDictComboBox.AutoCompleteCustomSource.AddRange(arr);
+        }
+
+        private void FillClipList(YcdFile ycd)
+        {
+            Ycd = ycd;
+            ClipComboBox.Items.Clear();
+            ClipComboBox.Items.Add("");
+            if (ycd?.ClipMapEntries == null)
+            {
+                ClipComboBox.SelectedIndex = 0;
+                AnimClip = null;
+                return;
+            }
+            var items = new List<string>();
+            foreach (var cme in ycd.ClipMapEntries)
+            {
+                if (cme.Clip != null) items.Add(cme.Clip.ShortName);
+            }
+            items.Sort();
+            foreach (var item in items) ClipComboBox.Items.Add(item);
+        }
+
         private void LoadClipDict(string name)
         {
+            if (gta6ClipLoader != null)
+            {
+                var key = (name ?? "").Trim().ToLowerInvariant();
+                YcdFile ycd9 = null;
+                if (gta6ClipNames.Contains(key))
+                {
+                    string note;
+                    try
+                    {
+                        Cursor = Cursors.WaitCursor;
+                        ycd9 = gta6ClipLoader(key, Skeleton, out note);
+                    }
+                    catch (Exception ex) { note = key + ": " + ex.Message; }
+                    finally { Cursor = Cursors.Default; }
+                    if (note != null) UpdateStatus(note);
+                }
+                FillClipList(ycd9);
+                return;
+            }
             if (gameFileCache == null) return;
             if (!gameFileCache.IsInited) return;//what to do here? wait for it..?
 
