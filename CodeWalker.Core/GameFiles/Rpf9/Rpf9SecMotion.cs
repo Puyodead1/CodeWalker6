@@ -68,6 +68,10 @@ namespace CodeWalker.GameFiles
             public bool HasBounds;
             public int GpuCount, GpuStride;                                   // type 3
             public List<uint> Hashes = new List<uint>();                      // type 3
+            public List<Vector4[]> Strands = new List<Vector4[]>();           // type 3: guide strand points (model space xyz, w = thickness)
+            public int[] StrandTriangles = new int[0];                        // type 3: strand index triples (the strands' root mesh)
+            public List<uint> StrandBones = new List<uint>();                 // type 3: bone tags in the descriptor
+            public string StrandError;                                        // type 3: why the strand buffer wasn't decoded
 
             public static string TypeName(int t)
             {
@@ -97,6 +101,14 @@ namespace CodeWalker.GameFiles
             public uint U32(long o) { Check(o, 4); return BitConverter.ToUInt32(B, (int)o); }
             public ulong U64(long o) { Check(o, 8); return BitConverter.ToUInt64(B, (int)o); }
             public float F32(long o) { Check(o, 4); return BitConverter.ToSingle(B, (int)o); }
+            public float F16(long o)
+            {
+                int h = U16(o);
+                int s = (h >> 15) != 0 ? -1 : 1, e = (h >> 10) & 0x1f, m = h & 0x3ff;
+                if (e == 0) return s * m * (1.0f / (1 << 24));
+                if (e == 31) return m == 0 ? s * float.PositiveInfinity : float.NaN;
+                return s * (1 + m / 1024.0f) * (float)Math.Pow(2, e - 15);
+            }
             public Vector3 V3(long o) => new Vector3(F32(o), F32(o + 4), F32(o + 8));
             public Vector4 V4(long o) => new Vector4(F32(o), F32(o + 4), F32(o + 8), F32(o + 12));
             /// <summary>Virtual pointer -> file offset, -1 for null or anything outside the virtual segment.</summary>
@@ -299,6 +311,77 @@ namespace CodeWalker.GameFiles
             }
             var (p, n) = r.Vec(0x98, 4);
             for (int i = 0; i < n; i++) z.Hashes.Add(r.U32(p + 4L * i));
+            for (int i = 0; i < 6; i++)
+            {
+                uint t = r.U32(0xb8 + 4 * i);
+                if (t != 0 && t != StrandBoneFiller && !z.StrandBones.Contains(t)) z.StrandBones.Add(t);
+            }
+            if (g >= 0) ReadStrands(r, z);
+        }
+
+        const uint StrandBoneFiller = 0x89ea2ed6;
+
+        /// <summary>
+        /// Type 3 physical segment (data pointer 0x60000000, right after the virtual data, 16-aligned):
+        /// a strand simulation buffer. Header u32[32]: [0..19] region offsets, [22] = (triangles &lt;&lt; 16) | strands,
+        /// [23] = points per strand. [17] points (strands * points * half4: xyz model space, w thickness),
+        /// [16] triangles (u16 strand index triples), [12] strand lengths, [14] total + segment lengths,
+        /// [1] strand -> triangle, [2] barycentrics (half2).
+        /// </summary>
+        static void ReadStrands(Reader r, Zsm z)
+        {
+            long size = (long)z.GpuCount * z.GpuStride;
+            if (size < 0x80 || size > r.B.Length) { z.StrandError = "no buffer"; return; }
+            // the physical segment follows the (small) virtual one, but is often padded to a page multiple,
+            // so look for the first header that holds together
+            long phys = -1;
+            for (long o = 0x140; o + size <= r.B.Length; o += 16)
+                if (StrandHeaderOk(r, z, o, size)) { phys = o; break; }
+            if (phys < 0) { z.StrandError = "strand header not found"; return; }
+            uint counts = r.U32(phys + 22 * 4);
+            int strands = (int)(counts & 0xffff), tris = (int)(counts >> 16), points = (int)r.U32(phys + 23 * 4);
+            long pos = phys + r.U32(phys + 17 * 4);
+            for (int s = 0; s < strands; s++)
+            {
+                var pts = new Vector4[points];
+                for (int k = 0; k < points; k++)
+                {
+                    long o = pos + 8L * (s * points + k);
+                    pts[k] = new Vector4(r.F16(o), r.F16(o + 2), r.F16(o + 4), r.F16(o + 6));
+                }
+                z.Strands.Add(pts);
+            }
+            long tri = phys + r.U32(phys + 16 * 4);
+            var ti = new List<int>(tris * 3);
+            for (int i = 0; i < tris; i++)
+            {
+                int a = r.U16(tri + 6L * i), b = r.U16(tri + 6L * i + 2), c = r.U16(tri + 6L * i + 4);
+                if (a < strands && b < strands && c < strands) { ti.Add(a); ti.Add(b); ti.Add(c); }
+            }
+            z.StrandTriangles = ti.ToArray();
+        }
+
+        static bool StrandHeaderOk(Reader r, Zsm z, long phys, long size)
+        {
+            if (phys < 0 || phys + size > r.B.Length) return false;
+            uint counts = r.U32(phys + 22 * 4);
+            long strands = counts & 0xffff, tris = counts >> 16, points = r.U32(phys + 23 * 4);
+            long pos = r.U32(phys + 17 * 4), tri = r.U32(phys + 16 * 4);
+            if (strands <= 0 || points <= 0 || points > 1024) return false;
+            if (pos < 0x80 || pos + strands * points * 8 > size || tri < 0x80 || tri + tris * 6 > size) return false;
+            for (int i = 0; i < 20; i++)
+            {
+                if (i == 11) continue; // usually 0xffffffff, not an offset
+                uint w = r.U32(phys + 4 * i);
+                if (w != 0 && w != 0xffffffff && (w < 0x80 || w >= size)) return false;
+            }
+            if (z.HasBounds)
+            {
+                var p = new Vector3(r.F16(phys + pos), r.F16(phys + pos + 2), r.F16(phys + pos + 4));
+                var lo = z.BoundsMin - new Vector3(0.5f); var hi = z.BoundsMax + new Vector3(0.5f);
+                if (!(p.X >= lo.X && p.Y >= lo.Y && p.Z >= lo.Z && p.X <= hi.X && p.Y <= hi.Y && p.Z <= hi.Z)) return false;
+            }
+            return true;
         }
 
         static void ReadType4(Reader r, Zsm z)
@@ -427,8 +510,21 @@ namespace CodeWalker.GameFiles
                     break;
                 case 3:
                     if (z.HasBounds) sb.AppendLine("bounds " + F(z.BoundsMin) + " - " + F(z.BoundsMax));
-                    sb.AppendLine("GPU buffer: " + z.GpuCount + " x " + z.GpuStride + " bytes (compute shader data, not decoded)");
+                    sb.AppendLine("GPU buffer: " + z.GpuCount + " x " + z.GpuStride + " bytes");
+                    if (z.StrandBones.Count > 0) sb.AppendLine("bones: " + string.Join(", ", z.StrandBones.Select(B)));
                     sb.AppendLine("hashes: " + string.Join(", ", z.Hashes.Select(B)));
+                    if (z.StrandError != null) { sb.AppendLine("strands: " + z.StrandError); break; }
+                    int np = z.Strands.Count > 0 ? z.Strands[0].Length : 0;
+                    sb.AppendLine("strands: " + z.Strands.Count + " guide strands x " + np + " points, " + z.StrandTriangles.Length / 3 + " root triangles");
+                    sb.AppendLine("  points (x, y, z, thickness):");
+                    for (int s = 0; s < z.Strands.Count; s++)
+                    {
+                        var pts = z.Strands[s];
+                        float len = 0;
+                        for (int k = 1; k < pts.Length; k++) len += (new Vector3(pts[k].X, pts[k].Y, pts[k].Z) - new Vector3(pts[k - 1].X, pts[k - 1].Y, pts[k - 1].Z)).Length();
+                        sb.AppendLine("  strand " + s + ", length " + F(len) + ":");
+                        foreach (var v in pts) sb.AppendLine("    " + F(new Vector3(v.X, v.Y, v.Z)) + " " + F(v.W));
+                    }
                     break;
                 case 4:
                 case 5:

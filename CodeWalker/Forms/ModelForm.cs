@@ -1011,6 +1011,8 @@ namespace CodeWalker.Forms
             public List<SecMotionSet> Sets = new List<SecMotionSet>();
             public List<Bone[]> Links = new List<Bone[]>();   // type 1: bone pairs
             public List<Bone> Bones = new List<Bone>();       // type 1: dangle bones
+            public Bone StrandBone;                           // type 3: strands follow this bone rigidly (null = bind pose)
+            public Vector3[] StrandScratch;                   // render thread only
             public int Matched, Total;                        // bone tags found in the skeleton
         }
         private class SecMotionSet
@@ -1048,6 +1050,7 @@ namespace CodeWalker.Forms
                 var tags = new HashSet<uint>();
                 foreach (var s in z.Sets) foreach (var p in s.Particles) for (int k = 0; k < 8; k++) if (p.Weights[k] != 0) tags.Add(p.Bones[k]);
                 foreach (var b in z.Bones) tags.Add(b);
+                foreach (var b in z.StrandBones) tags.Add(b);
 
                 // the skeleton that knows most of this file's bone tags
                 Skeleton best = null; Dictionary<uint, ushort> bestMap = null; int bestHits = -1;
@@ -1089,6 +1092,10 @@ namespace CodeWalker.Forms
                     if (a != null && b != null && a != b) d.Links.Add(new[] { a, b });
                 }
                 foreach (var t in z.Bones) { var b = B(t); if (b != null) d.Bones.Add(b); }
+                var sb = z.StrandBones.Select(B).Where(b => b != null).Distinct().ToList();
+                if (sb.Count == 1) d.StrandBone = sb[0];
+                int maxPts = z.Strands.Count > 0 ? z.Strands.Max(s => s.Length) : 0;
+                d.StrandScratch = new Vector3[Math.Max(maxPts, 1)];
 
                 bool needsBones = z.Type == 1 || z.Type == 2;
                 if (!needsBones || d.Matched > 0) bound++;
@@ -1153,7 +1160,33 @@ namespace CodeWalker.Forms
                 }
                 foreach (var l in d.Links) Line(l[0].AnimTransform.TranslationVector, l[1].AnimTransform.TranslationVector, d.Colour);
                 foreach (var b in d.Bones) Star(b.AnimTransform.TranslationVector, d.Colour, 0.008f);
-                if (d.Zsm.Type == 3 && d.Zsm.HasBounds)
+                if (d.Zsm.Strands.Count > 0)
+                {
+                    var sbone = d.StrandBone;
+                    var strands = d.Zsm.Strands;
+                    var roots = new Vector3[strands.Count];
+                    for (int s = 0; s < strands.Count; s++)
+                    {
+                        var pts = strands[s];
+                        var w = d.StrandScratch;
+                        for (int k = 0; k < pts.Length; k++)
+                        {
+                            var v = new Vector3(pts[k].X, pts[k].Y, pts[k].Z);
+                            w[k] = sbone != null ? Vector3.TransformCoordinate(v, sbone.SkinTransform) : v;
+                        }
+                        for (int k = 1; k < pts.Length; k++) Line(w[k - 1], w[k], d.Colour);
+                        roots[s] = w[0];
+                    }
+                    var tri = d.Zsm.StrandTriangles;
+                    uint dim = (d.Colour & 0x00ffffff) | 0x60000000;
+                    for (int i = 0; i + 2 < tri.Length; i += 3)
+                    {
+                        Line(roots[tri[i]], roots[tri[i + 1]], dim);
+                        Line(roots[tri[i + 1]], roots[tri[i + 2]], dim);
+                        Line(roots[tri[i + 2]], roots[tri[i]], dim);
+                    }
+                }
+                else if (d.Zsm.Type == 3 && d.Zsm.HasBounds)
                 {
                     var mn = d.Zsm.BoundsMin; var mx = d.Zsm.BoundsMax;
                     var c = new Vector3[8];
