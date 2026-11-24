@@ -413,7 +413,7 @@ namespace CodeWalker
             InitFileType(".znh", "Nav Hierarchy", 9);
             InitFileType(".zfd", "Frame Filter Dictionary", 9);
             InitFileType(".zas", "Asset (PRD0)", 20);
-            InitFileType(".zsm", "Strand / Skeletal Mesh", 11);
+            InitFileType(".zsm", "Secondary Motion", 9, FileTypeAction.ViewText);
             InitFileType(".zscript", "Script", 13);
             InitFileType(".zascript", "Script", 13);
             InitFileType(".zsma", "ZSMA", 9);
@@ -435,7 +435,7 @@ namespace CodeWalker
             InitFileType(".zsmm", "ZSMM", 9);
             InitFileType(".zascd", "Asset (PRD0, ZASCD)", 20);
             InitFileType(".zrd", "ZRD", 9);
-            InitFileType(".zsmam", "ZSMAM", 9);
+            InitFileType(".zsmam", "Secondary Motion Asset Map", 9, FileTypeAction.ViewText);
             InitFileType(".zldbmt", "Level Database Metadata (PRD0)", 20, FileTypeAction.ViewXml, true);
             InitFileType(".zkit", "Kit (PRD0)", 20, FileTypeAction.ViewXml, true);
             InitFileType(".zcgc", "ZCGC", 9);
@@ -840,6 +840,8 @@ namespace CodeWalker
             AllRpfs = null;
             gta6Textures?.Dispose();   // reopened on the next model view, picking up new packs
             gta6Textures = null;
+            gta6Index = null;          // rebuilt from the new archives on first use
+            gta6ClipCache.Clear();
 
             ClearMainTreeView();
 
@@ -1767,6 +1769,7 @@ namespace CodeWalker
                 if (fe is Rpf9FileEntry fe9)
                 {
                     if (ViewRpf9Meta(name, path, data, fe9)) return;
+                    if (ViewRpf9SecMotion(name, path, data, fe9)) return;
                     if (ft.DefaultAction == FileTypeAction.ViewXml && !IsTextXml(data)) { ViewHex(name, path, data); return; } //binary metadata that didn't decode
                 }
 
@@ -2046,15 +2049,23 @@ namespace CodeWalker
             }
         }
 
-        private Dictionary<string, Rpf9FileEntry> gta6ClipDicts;
-        private readonly List<KeyValuePair<string, Rpf9Anim.Dict>> gta6ClipCache = new List<KeyValuePair<string, Rpf9Anim.Dict>>();
-        /// <summary>GTA VI clip dictionaries (*.zcd) in the loaded archives, by lowercase name without extension.</summary>
-        private Dictionary<string, Rpf9FileEntry> Gta6ClipDicts
+        /// <summary>GTA VI entries the viewers look up by name: clip dictionaries, secondary motion and its asset maps, drawables.</summary>
+        private class Gta6EntryIndex
+        {
+            public readonly Dictionary<string, Rpf9FileEntry> ClipDicts = new Dictionary<string, Rpf9FileEntry>(); // *.zcd by lowercase name without extension
+            public readonly Dictionary<ulong, Rpf9FileEntry> ByHash = new Dictionary<ulong, Rpf9FileEntry>();      // .zsm/.zdr/.zdd/.zft by RPF9 name hash
+            public readonly List<Rpf9FileEntry> AssetMaps = new List<Rpf9FileEntry>();                              // *.zsmam
+            public Dictionary<ulong, ulong[]> SecMotion;          // drawable name hash -> .zsm name hashes (all asset maps merged)
+            public Dictionary<ulong, List<ulong>> SecMotionUsers; // .zsm name hash -> drawable name hashes
+            public List<string> SecMotionErrors = new List<string>();
+        }
+        private Gta6EntryIndex gta6Index;
+        private Gta6EntryIndex Gta6Index
         {
             get
             {
-                if (gta6ClipDicts != null) return gta6ClipDicts;
-                var res = new Dictionary<string, Rpf9FileEntry>();
+                if (gta6Index != null) return gta6Index;
+                var res = new Gta6EntryIndex();
                 var rpfs = AllRpfs;
                 if (rpfs == null) return res; // not loaded yet, try again next time
                 var seen = new HashSet<RpfFile>();
@@ -2067,14 +2078,122 @@ namespace CodeWalker
                     if (rpf.AllEntries == null) continue;
                     foreach (var fe in rpf.AllEntries.OfType<Rpf9FileEntry>())
                     {
-                        if (!fe.NameLower.EndsWith(".zcd")) continue;
-                        var key = fe.NameLower.Substring(0, fe.NameLower.Length - 4);
-                        if (!res.ContainsKey(key)) res[key] = fe;
+                        var nl = fe.NameLower;
+                        if (nl.EndsWith(".zcd"))
+                        {
+                            var key = nl.Substring(0, nl.Length - 4);
+                            if (!res.ClipDicts.ContainsKey(key)) res.ClipDicts[key] = fe;
+                        }
+                        else if (nl.EndsWith(".zsmam")) res.AssetMaps.Add(fe);
+                        else if (nl.EndsWith(".zsm") || nl.EndsWith(".zdr") || nl.EndsWith(".zdd") || nl.EndsWith(".zft"))
+                        {
+                            if (fe.NameHash64 != 0 && !res.ByHash.ContainsKey(fe.NameHash64)) res.ByHash[fe.NameHash64] = fe;
+                        }
                     }
                 }
-                gta6ClipDicts = res;
+                gta6Index = res;
                 return res;
             }
+        }
+        /// <summary>GTA VI secondary motion asset maps (*.zsmam), merged and decoded on first use.</summary>
+        private Gta6EntryIndex Gta6SecMotionIndex
+        {
+            get
+            {
+                var ix = Gta6Index;
+                if (ix.SecMotion != null || ix.AssetMaps.Count == 0) return ix;
+                var map = new Dictionary<ulong, ulong[]>();
+                var users = new Dictionary<ulong, List<ulong>>();
+                foreach (var fe in ix.AssetMaps)
+                {
+                    try
+                    {
+                        var data = fe.File.ExtractFile(fe);
+                        if (data == null) { ix.SecMotionErrors.Add("unable to extract " + fe.Path); continue; }
+                        foreach (var kv in Rpf9SecMotion.ReadAssetMap(data))
+                        {
+                            map[kv.Key] = map.TryGetValue(kv.Key, out var old) ? old.Concat(kv.Value).Distinct().ToArray() : kv.Value;
+                            foreach (var z in kv.Value)
+                            {
+                                if (!users.TryGetValue(z, out var l)) users[z] = l = new List<ulong>();
+                                if (!l.Contains(kv.Key)) l.Add(kv.Key);
+                            }
+                        }
+                    }
+                    catch (Exception ex) { ix.SecMotionErrors.Add(fe.Path + ": " + ex.Message); }
+                }
+                ix.SecMotion = map;
+                ix.SecMotionUsers = users;
+                return ix;
+            }
+        }
+        private readonly List<KeyValuePair<string, Rpf9Anim.Dict>> gta6ClipCache = new List<KeyValuePair<string, Rpf9Anim.Dict>>();
+        /// <summary>GTA VI clip dictionaries (*.zcd) in the loaded archives, by lowercase name without extension.</summary>
+        private Dictionary<string, Rpf9FileEntry> Gta6ClipDicts => Gta6Index.ClipDicts;
+
+        /// <summary>Secondary motion (.zsm) linked to a GTA VI drawable through the loaded .zsmam asset maps.</summary>
+        private List<KeyValuePair<string, Rpf9SecMotion.Zsm>> LoadGta6SecMotion(Rpf9FileEntry drawable, List<string> notes)
+        {
+            var res = new List<KeyValuePair<string, Rpf9SecMotion.Zsm>>();
+            var ix = Gta6SecMotionIndex;
+            if (ix.SecMotion == null || drawable == null) return res;
+            if (!ix.SecMotion.TryGetValue(drawable.NameHash64, out var list)) return res;
+            foreach (var h in list)
+            {
+                if (!ix.ByHash.TryGetValue(h, out var fe)) { notes.Add(h.ToString("x16") + ".zsm not in the loaded archives"); continue; }
+                try
+                {
+                    var data = fe.File.ExtractFile(fe);
+                    if (data == null) { notes.Add("unable to extract " + fe.Name); continue; }
+                    res.Add(new KeyValuePair<string, Rpf9SecMotion.Zsm>(fe.Name, Rpf9SecMotion.Read(data)));
+                }
+                catch (Exception ex) { notes.Add(fe.Name + ": " + ex.Message); }
+            }
+            return res;
+        }
+
+        /// <summary>GTA VI .zsm / .zsmam: text view. Returns false for other files.</summary>
+        private bool ViewRpf9SecMotion(string name, string path, byte[] data, Rpf9FileEntry e)
+        {
+            var nl = e.NameLower ?? "";
+            bool zsm = nl.EndsWith(".zsm"), zsmam = nl.EndsWith(".zsmam");
+            if (!zsm && !zsmam) return false;
+            string txt;
+            Cursor = Cursors.WaitCursor;
+            try
+            {
+                if (zsm)
+                {
+                    var z = Rpf9SecMotion.Read(data);
+                    var ix = Gta6SecMotionIndex;
+                    var usedBy = new List<string>();
+                    if (ix.SecMotionUsers != null && ix.SecMotionUsers.TryGetValue(e.NameHash64, out var users))
+                        foreach (var u in users) usedBy.Add(ix.ByHash.TryGetValue(u, out var de) ? de.Path : u.ToString("x16"));
+                    txt = Rpf9SecMotion.Summary(z, null, usedBy);
+                    if (z.Type == 2 || z.Type == 1) txt = "Bone tags show as hashes here. Open one of the drawables under \"used by\" to see bone names and this motion on its skeleton.\r\n\r\n" + txt;
+                }
+                else
+                {
+                    var map = Rpf9SecMotion.ReadAssetMap(data);
+                    var ix = Gta6Index;
+                    string N(ulong h) => ix.ByHash.TryGetValue(h, out var fe) ? fe.Path : h.ToString("x16");
+                    var sb = new StringBuilder();
+                    sb.AppendLine("Secondary motion asset map: " + map.Count + " drawables");
+                    sb.AppendLine();
+                    foreach (var kv in map.OrderBy(kv => N(kv.Key), StringComparer.OrdinalIgnoreCase))
+                    {
+                        sb.AppendLine(N(kv.Key));
+                        foreach (var z in kv.Value) sb.AppendLine("    " + N(z));
+                    }
+                    txt = sb.ToString();
+                }
+            }
+            catch (Exception ex) { txt = "Not a file this version understands: " + ex.Message; }
+            finally { Cursor = Cursors.Default; }
+            TextForm tf = new TextForm(this);
+            tf.Show();
+            tf.LoadReadOnlyText(name + ".txt", path, txt.Replace("\r\n", "\n").Replace("\n", "\r\n"));
+            return true;
         }
         /// <summary>ModelForm callback: GTA VI clip dictionary bound to the viewed skeleton (decoded dictionaries are cached).</summary>
         private YcdFile LoadGta6ClipDict(string name, Skeleton skel, out string note)
@@ -2149,6 +2268,15 @@ namespace CodeWalker
                     if (clipDicts.Count > 0) f9.SetGta6Clips(clipDicts.Keys, LoadGta6ClipDict);
                     animNote = ", " + nbones + " bones" + (clipDicts.Count > 0 ? " (type a clip dictionary name to play clips)" : " (no .zcd clip dictionaries loaded)");
                 }
+                var smNotes = new List<string>();
+                var secMotion = LoadGta6SecMotion(e9, smNotes);
+                if (secMotion.Count > 0)
+                {
+                    int bound = f9.SetGta6SecMotion(secMotion);
+                    animNote += ", " + secMotion.Count + " secondary motion (" + string.Join(", ", secMotion.GroupBy(z => z.Value.Type).OrderBy(g => g.Key).Select(g => g.Count() + " " + Rpf9SecMotion.Zsm.TypeName(g.Key)))
+                        + (bound < secMotion.Count ? "; " + (secMotion.Count - bound) + " with no matching bones" : "") + ")";
+                }
+                if (smNotes.Count > 0) notes.AddRange(smNotes);
                 int ntri = items.Sum(i => i.Triangles);
                 UpdateStatus(name + ": " + items.Count + " drawable(s), " + ntri.ToString("N0") + " triangles" + animNote + ", " + textured + "/" + texShaders + " shaders textured" + texNote + (notes.Count > 0 ? "; " + notes.Count + " skipped: " + string.Join("; ", notes.Take(3)) : ""));
                 return;

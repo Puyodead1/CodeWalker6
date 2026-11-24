@@ -293,6 +293,8 @@ namespace CodeWalker.Forms
 
             Renderer.RenderQueued();
 
+            RenderSecMotion(); //after the queued drawables, so bones hold this frame's pose
+
             Renderer.RenderSelectionGeometry(MapSelectionMode.Entity);
 
             Renderer.RenderFinalPass();
@@ -998,6 +1000,170 @@ namespace CodeWalker.Forms
             Array.Sort(arr, StringComparer.Ordinal);
             ClipDictComboBox.AutoCompleteCustomSource.Clear();
             ClipDictComboBox.AutoCompleteCustomSource.AddRange(arr);
+        }
+
+        /// <summary>A GTA VI secondary motion file bound to one of the viewed skeletons.</summary>
+        private class SecMotionDraw
+        {
+            public string Name;
+            public Rpf9SecMotion.Zsm Zsm;
+            public uint Colour;
+            public List<SecMotionSet> Sets = new List<SecMotionSet>();
+            public List<Bone[]> Links = new List<Bone[]>();   // type 1: bone pairs
+            public List<Bone> Bones = new List<Bone>();       // type 1: dangle bones
+            public int Matched, Total;                        // bone tags found in the skeleton
+        }
+        private class SecMotionSet
+        {
+            public Rpf9SecMotion.ParticleSet Set;
+            public Bone[][] Bones;      // per particle, resolved bones (null = tag not in the skeleton)
+            public float[][] Weights;   // per particle, 0-1
+            public Vector3[] Positions; // scratch, render thread only
+        }
+        private volatile List<SecMotionDraw> secMotion;
+        private volatile bool showSecMotion = true;
+        private CheckBox SecMotionCheckBox;
+        private readonly List<VertexTypePC> secMotionVerts = new List<VertexTypePC>();
+
+        /// <summary>
+        /// GTA VI: draw these secondary motion files (.zsm) on the viewed model, skinned to its skeleton.
+        /// Returns how many could be bound (types 1 and 2 need bone tags that exist in one of the skeletons).
+        /// </summary>
+        public int SetGta6SecMotion(List<KeyValuePair<string, Rpf9SecMotion.Zsm>> files)
+        {
+            var skels = new List<Skeleton>();
+            if (Ydr?.Drawable?.Skeleton != null) skels.Add(Ydr.Drawable.Skeleton);
+            if (Ydd?.Drawables != null) foreach (var d in Ydd.Drawables) if (d?.Skeleton != null && !skels.Contains(d.Skeleton)) skels.Add(d.Skeleton);
+
+            uint[] palette =
+            {
+                (uint)new Color(255, 80, 200).ToRgba(), (uint)new Color(0, 220, 255).ToRgba(), (uint)new Color(255, 200, 0).ToRgba(),
+                (uint)new Color(120, 255, 80).ToRgba(), (uint)new Color(255, 120, 40).ToRgba(), (uint)new Color(160, 140, 255).ToRgba(),
+            };
+            var list = new List<SecMotionDraw>();
+            int bound = 0;
+            foreach (var kv in files)
+            {
+                var z = kv.Value;
+                var tags = new HashSet<uint>();
+                foreach (var s in z.Sets) foreach (var p in s.Particles) for (int k = 0; k < 8; k++) if (p.Weights[k] != 0) tags.Add(p.Bones[k]);
+                foreach (var b in z.Bones) tags.Add(b);
+
+                // the skeleton that knows most of this file's bone tags
+                Skeleton best = null; Dictionary<uint, ushort> bestMap = null; int bestHits = -1;
+                foreach (var sk in skels)
+                {
+                    var map = Rpf9Drawable.BoneHashMap(sk);
+                    if (map == null) continue;
+                    int hits = tags.Count(t => map.ContainsKey(t));
+                    if (hits > bestHits) { best = sk; bestMap = map; bestHits = hits; }
+                }
+                Bone B(uint tag)
+                {
+                    if (best?.BonesMap == null || bestMap == null || !bestMap.TryGetValue(tag, out var bt)) return null;
+                    return best.BonesMap.TryGetValue(bt, out var bone) ? bone : null;
+                }
+
+                var d = new SecMotionDraw { Name = kv.Key, Zsm = z, Colour = palette[list.Count % palette.Length], Total = tags.Count, Matched = Math.Max(bestHits, 0) };
+                foreach (var s in z.Sets)
+                {
+                    if (s.Name.StartsWith("chain 1")) continue; // low-detail copy of chain 0
+                    var ms = new SecMotionSet { Set = s, Bones = new Bone[s.Particles.Count][], Weights = new float[s.Particles.Count][], Positions = new Vector3[s.Particles.Count] };
+                    for (int i = 0; i < s.Particles.Count; i++)
+                    {
+                        var p = s.Particles[i];
+                        ms.Bones[i] = new Bone[8];
+                        ms.Weights[i] = new float[8];
+                        for (int k = 0; k < 8; k++)
+                        {
+                            if (p.Weights[k] == 0) continue;
+                            ms.Bones[i][k] = B(p.Bones[k]);
+                            ms.Weights[i][k] = p.Weights[k] / 255.0f;
+                        }
+                    }
+                    d.Sets.Add(ms);
+                }
+                foreach (var l in z.Links)
+                {
+                    var a = B(l.BoneA); var b = B(l.BoneB);
+                    if (a != null && b != null && a != b) d.Links.Add(new[] { a, b });
+                }
+                foreach (var t in z.Bones) { var b = B(t); if (b != null) d.Bones.Add(b); }
+
+                bool needsBones = z.Type == 1 || z.Type == 2;
+                if (!needsBones || d.Matched > 0) bound++;
+                list.Add(d);
+            }
+            secMotion = list;
+
+            if (SecMotionCheckBox == null)
+            {
+                SecMotionCheckBox = new CheckBox
+                {
+                    AutoSize = true,
+                    Location = new System.Drawing.Point(6, 237),
+                    Text = "Show Secondary Motion",
+                    Checked = showSecMotion,
+                };
+                SecMotionCheckBox.CheckedChanged += (s, e) => showSecMotion = SecMotionCheckBox.Checked;
+                OptionsRenderTabPage.Controls.Add(SecMotionCheckBox);
+            }
+            return bound;
+        }
+
+        /// <summary>Lines for the secondary motion files: type 2 particles and their constraints, type 1 bone links, type 3 bounds.</summary>
+        private void RenderSecMotion()
+        {
+            var list = secMotion;
+            if (list == null || list.Count == 0 || !showSecMotion) return;
+            secMotionVerts.Clear();
+            var campos = Renderer.camera.Position;
+            void Line(Vector3 a, Vector3 b, uint c)
+            {
+                secMotionVerts.Add(new VertexTypePC { Position = a, Colour = c });
+                secMotionVerts.Add(new VertexTypePC { Position = b, Colour = c });
+            }
+            void Star(Vector3 p, uint c, float scale)
+            {
+                float s = (p - campos).Length() * scale;
+                Line(p - Vector3.UnitX * s, p + Vector3.UnitX * s, c);
+                Line(p - Vector3.UnitY * s, p + Vector3.UnitY * s, c);
+                Line(p - Vector3.UnitZ * s, p + Vector3.UnitZ * s, c);
+            }
+            foreach (var d in list)
+            {
+                foreach (var ms in d.Sets)
+                {
+                    var parts = ms.Set.Particles;
+                    for (int i = 0; i < parts.Count; i++)
+                    {
+                        var bp = parts[i].Position;
+                        Vector3 sum = Vector3.Zero; float wsum = 0;
+                        var bones = ms.Bones[i]; var w = ms.Weights[i];
+                        for (int k = 0; k < 8; k++)
+                        {
+                            if (bones[k] == null || w[k] <= 0) continue;
+                            sum += Vector3.TransformCoordinate(bp, bones[k].SkinTransform) * w[k];
+                            wsum += w[k];
+                        }
+                        ms.Positions[i] = wsum > 0 ? sum / wsum : bp;
+                    }
+                    foreach (var e in ms.Set.Edges) Line(ms.Positions[e[0]], ms.Positions[e[1]], d.Colour);
+                    foreach (var p in ms.Positions) Star(p, d.Colour, 0.002f);
+                }
+                foreach (var l in d.Links) Line(l[0].AnimTransform.TranslationVector, l[1].AnimTransform.TranslationVector, d.Colour);
+                foreach (var b in d.Bones) Star(b.AnimTransform.TranslationVector, d.Colour, 0.008f);
+                if (d.Zsm.Type == 3 && d.Zsm.HasBounds)
+                {
+                    var mn = d.Zsm.BoundsMin; var mx = d.Zsm.BoundsMax;
+                    var c = new Vector3[8];
+                    for (int i = 0; i < 8; i++) c[i] = new Vector3((i & 1) != 0 ? mx.X : mn.X, (i & 2) != 0 ? mx.Y : mn.Y, (i & 4) != 0 ? mx.Z : mn.Z);
+                    for (int i = 0; i < 8; i++)
+                        for (int k = 1; k < 8; k <<= 1)
+                            if ((i & k) == 0) Line(c[i], c[i | k], d.Colour);
+                }
+            }
+            if (secMotionVerts.Count > 0) Renderer.RenderLines(secMotionVerts, DepthStencilMode.DisableAll);
         }
 
         private void FillClipList(YcdFile ycd)
