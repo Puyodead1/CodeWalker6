@@ -2055,6 +2055,7 @@ namespace CodeWalker
             public readonly Dictionary<string, Rpf9FileEntry> ClipDicts = new Dictionary<string, Rpf9FileEntry>(); // *.zcd by lowercase name without extension
             public readonly Dictionary<ulong, Rpf9FileEntry> ByHash = new Dictionary<ulong, Rpf9FileEntry>();      // .zsm/.zdr/.zdd/.zft by RPF9 name hash
             public readonly List<Rpf9FileEntry> AssetMaps = new List<Rpf9FileEntry>();                              // *.zsmam
+            public readonly Dictionary<string, Rpf9FileEntry> Fragments = new Dictionary<string, Rpf9FileEntry>(); // *.zft by lowercase name without extension (character rigs)
             public Dictionary<ulong, ulong[]> SecMotion;          // drawable name hash -> .zsm name hashes (all asset maps merged)
             public Dictionary<ulong, List<ulong>> SecMotionUsers; // .zsm name hash -> drawable name hashes
             public List<string> SecMotionErrors = new List<string>();
@@ -2088,6 +2089,11 @@ namespace CodeWalker
                         else if (nl.EndsWith(".zsm") || nl.EndsWith(".zdr") || nl.EndsWith(".zdd") || nl.EndsWith(".zft"))
                         {
                             if (fe.NameHash64 != 0 && !res.ByHash.ContainsKey(fe.NameHash64)) res.ByHash[fe.NameHash64] = fe;
+                            if (nl.EndsWith(".zft"))
+                            {
+                                var key = nl.Substring(0, nl.Length - 4);
+                                if (!res.Fragments.ContainsKey(key)) res.Fragments[key] = fe;
+                            }
                         }
                     }
                 }
@@ -2221,6 +2227,33 @@ namespace CodeWalker
             return ycd;
         }
 
+        /// <summary>
+        /// GTA VI: the rig skeleton of a metaped part, from the .zft whose name is the longest prefix of the part's
+        /// name at an underscore (crm_dog_poodlestandard_m_00_fur_head_00 -> crm_dog_poodlestandard_m_00.zft).
+        /// </summary>
+        private Skeleton LoadGta6Rig(Rpf9FileEntry part, out string rigName)
+        {
+            rigName = null;
+            var nl = part?.NameLower ?? "";
+            var stem = Path.GetFileNameWithoutExtension(nl);
+            var frags = Gta6Index.Fragments;
+            for (int i = stem.LastIndexOf('_'); i > 0; i = stem.LastIndexOf('_', i - 1))
+            {
+                if (!frags.TryGetValue(stem.Substring(0, i), out var fe) || fe == part) continue;
+                try
+                {
+                    var data = fe.File.ExtractFile(fe);
+                    if (data == null) continue;
+                    var sk = Rpf9Drawable.Read(data, fe.VirtualSize).Select(x => x.Drawable?.Skeleton).FirstOrDefault(s => s != null);
+                    if (sk == null) continue;
+                    rigName = fe.Name;
+                    return sk;
+                }
+                catch (Exception) { }
+            }
+            return null;
+        }
+
         private void ViewModel(string name, string path, byte[] data, RpfFileEntry e)
         {
             if (e is Rpf9FileEntry e9)
@@ -2230,10 +2263,15 @@ namespace CodeWalker
                 List<Rpf9Drawable.Item> items;
                 Cursor = Cursors.WaitCursor;
                 int textured = 0, texShaders = 0;
-                string texNote = "";
+                string texNote = "", rigNote = "";
                 try
                 {
-                    items = Rpf9Drawable.Read(data, e9.VirtualSize, notes);
+                    var rig = LoadGta6Rig(e9, out string rigName);
+                    items = Rpf9Drawable.Read(data, e9.VirtualSize, notes, rig);
+                    if (items.Any(i => i.RigUse == 2)) rigNote = ", own skeleton attached to rig " + rigName;
+                    else if (items.Any(i => i.RigUse == 1)) rigNote = ", skinned to rig " + rigName;
+                    int miss = items.Sum(i => i.MissingBones);
+                    if (miss > 0) rigNote += " (" + miss + " bones the mesh names aren't in the skeleton)";
                     try
                     {
                         var store = Gta6Textures;
@@ -2266,7 +2304,7 @@ namespace CodeWalker
                 {
                     var clipDicts = Gta6ClipDicts;
                     if (clipDicts.Count > 0) f9.SetGta6Clips(clipDicts.Keys, LoadGta6ClipDict);
-                    animNote = ", " + nbones + " bones" + (clipDicts.Count > 0 ? " (type a clip dictionary name to play clips)" : " (no .zcd clip dictionaries loaded)");
+                    animNote = ", " + nbones + " bones" + rigNote + (clipDicts.Count > 0 ? " (type a clip dictionary name to play clips)" : " (no .zcd clip dictionaries loaded)");
                 }
                 var smNotes = new List<string>();
                 var secMotion = LoadGta6SecMotion(e9, smNotes);

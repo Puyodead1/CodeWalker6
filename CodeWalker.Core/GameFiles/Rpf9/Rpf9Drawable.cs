@@ -29,6 +29,9 @@ namespace CodeWalker.GameFiles
             public Drawable Drawable;
             public int Triangles;
             public int Bones;         // skeleton bone count, 0 without a skeleton
+            public int MaxJoint = -1; // highest blend index in the meshes as stored (-1 = no blend data)
+            public int RigUse;        // with a rig skeleton: 0 not used, 1 skinned to the rig, 2 own skeleton appended to the rig's
+            public int MissingBones;  // bones the meshes name that the skeleton lacks (bound to bone 0)
             public List<TexRef> TexRefs = new List<TexRef>();
         }
 
@@ -45,6 +48,7 @@ namespace CodeWalker.GameFiles
             public byte[] Joints;       // 4 per vertex (skeleton bone indices) or null
             public int[] Indices;       // 3 per triangle
             public int Shader;
+            public uint[] BoneHashes;   // the model's bone list: Joints[k] = j means the bone whose name hash is BoneHashes[j] (null = skeleton index)
         }
 
         // ------------------------------------------------------------------ helpers
@@ -84,7 +88,7 @@ namespace CodeWalker.GameFiles
             return new[] { (long)(g - P_GPU), (long)n * 4 };
         }
 
-        class GeomRef { public long VO, VS, MO, MS; public int Shader; }
+        class GeomRef { public long VO, VS, MO, MS; public int Shader; public uint[] Bones; }
 
         /// <summary>-> per LOD (index 0..3, null when missing): models -> geometries</summary>
         static List<GeomRef>[][] Walk(Res r, long root)
@@ -112,6 +116,15 @@ namespace CodeWalker.GameFiles
                     int gn = r.U16(m + 0x10);
                     long sidx = r.CPtr(m + 0x20);
                     if (garr < 0 || gn <= 0 || gn >= 1024) Bad("geometry array");
+                    // the model's bones: blend index j = the bone whose name hash is entry j (u16 count at +0x14)
+                    uint[] mbones = null;
+                    int bc = r.U16(m + 0x14);
+                    long bl = m + 0x30 <= r.C.Length ? r.CPtr(m + 0x28) : -1;
+                    if (bc > 0 && bl >= 0 && bl + 4L * bc <= r.C.Length)
+                    {
+                        mbones = new uint[bc];
+                        for (int k = 0; k < bc; k++) mbones[k] = r.U32(bl + 4 * k);
+                    }
                     var geoms = new List<GeomRef>();
                     for (int gi = 0; gi < gn; gi++)
                     {
@@ -121,7 +134,7 @@ namespace CodeWalker.GameFiles
                         long holder = r.CPtr(go + 0x40);
                         var mb = BufferObj(r, holder >= 0 ? r.CPtr(holder) : -1, 0x1380);
                         int mat = (sidx >= 0 && sidx + 2 * gi + 2 <= r.C.Length) ? r.U16(sidx + 2 * gi) : 0;
-                        geoms.Add(new GeomRef { VO = vb[0], VS = vb[1], MO = mb[0], MS = mb[1], Shader = mat });
+                        geoms.Add(new GeomRef { VO = vb[0], VS = vb[1], MO = mb[0], MS = mb[1], Shader = mat, Bones = mbones });
                     }
                     models[mi] = geoms;
                 }
@@ -479,17 +492,113 @@ namespace CodeWalker.GameFiles
                 mx.M14 = 0; mx.M24 = 0; mx.M34 = 0; mx.M44 = 1;
                 inv[i] = mx;
             }
+            return MakeSkeleton(bones, parents, inv, hashes);
+        }
+
+        static Skeleton MakeSkeleton(Bone[] bones, short[] parents, Matrix[] inv, Dictionary<uint, ushort> hashes)
+        {
             var skel = new Skeleton
             {
-                Bones = new SkeletonBonesBlock { Items = bones, Count = (uint)n },
+                Bones = new SkeletonBonesBlock { Items = bones, Count = (uint)bones.Length },
                 ParentIndices = parents,
                 TransformationsInverted = inv,
-                BonesCount = (ushort)n,
+                BonesCount = (ushort)bones.Length,
             };
             skel.AssignBoneParents();
             skel.BuildBonesMap();
             boneHashes.Add(skel, hashes);
             return skel;
+        }
+
+        /// <summary>
+        /// Metaped parts (.zdd) are skinned to their character's rig skeleton (the rig .zft of the same name prefix).
+        /// A part with no skeleton of its own indexes the rig's bones directly: returns the rig. A part with a
+        /// skeleton the rig lacks (a head's facial skeleton) gets a new skeleton: the rig's bones, then the part's
+        /// (its blend indices start at jointBase = rig bone count), its roots hung under SKEL_Head for facial
+        /// skeletons, else under the rig bone nearest the root. A part whose skeleton is mostly the rig's keeps it.
+        /// </summary>
+        public static Skeleton BindToRig(Skeleton rig, Skeleton own, Item it, out int jointBase)
+        {
+            jointBase = 0;
+            var rb = rig?.Bones?.Items;
+            if (rb == null || rb.Length == 0 || rig.TransformationsInverted == null) return own;
+            if (own == null) return rig;
+            var ob = own.Bones?.Items;
+            if (ob == null || own.TransformationsInverted == null) return own;
+            var rigNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var b in rb) rigNames.Add(b.Name);
+            int shared = 0;
+            foreach (var b in ob) if (rigNames.Contains(b.Name)) shared++;
+            if (shared * 2 >= ob.Length) return own;
+
+            int nr = rb.Length, no = ob.Length, n = nr + no;
+            Matrix BindWorld(Skeleton s, int i) => Matrix.Invert(s.TransformationsInverted[i]);
+            // a facial skeleton (root FACIAL_*) is in the space of the rig's SKEL_Head, bind matrices included
+            int head = -1;
+            if (no > 0 && ob[0].ParentIndex < 0 && ob[0].Name.StartsWith("FACIAL", StringComparison.OrdinalIgnoreCase))
+                for (int i = 0; i < nr; i++) if (string.Equals(rb[i].Name, "SKEL_Head", StringComparison.OrdinalIgnoreCase)) { head = i; break; }
+            int AttachFor(int root)
+            {
+                if (head >= 0) return head;
+                var p = BindWorld(own, root).TranslationVector;
+                int best = 0; float bd = float.MaxValue;
+                for (int i = 0; i < nr; i++)
+                {
+                    float d = (BindWorld(rig, i).TranslationVector - p).LengthSquared();
+                    if (d < bd) { bd = d; best = i; }
+                }
+                return best;
+            }
+            Bone Copy(Bone b, int idx, int parent) => new Bone
+            {
+                Rotation = b.Rotation, Translation = b.Translation, Scale = b.Scale,
+                AnimRotation = b.Rotation, AnimTranslation = b.Translation, AnimScale = b.Scale,
+                Index = (short)idx, Tag = (ushort)idx, ParentIndex = (short)parent, NextSiblingIndex = -1, Name = b.Name,
+            };
+
+            var bones = new Bone[n];
+            var parents = new short[n];
+            var inv = new Matrix[n];
+            for (int i = 0; i < nr; i++)
+            {
+                bones[i] = Copy(rb[i], i, rb[i].ParentIndex);
+                parents[i] = rb[i].ParentIndex;
+                inv[i] = rig.TransformationsInverted[i];
+            }
+            for (int j = 0; j < no; j++)
+            {
+                int i = nr + j;
+                var b = ob[j];
+                if (b.ParentIndex >= 0)
+                {
+                    bones[i] = Copy(b, i, nr + b.ParentIndex);
+                }
+                else if (head >= 0)
+                {
+                    // already relative to SKEL_Head
+                    bones[i] = Copy(b, i, head);
+                }
+                else
+                {
+                    // root in model space: make it relative to the rig bone it hangs from
+                    int a = AttachFor(j);
+                    var local = BindWorld(own, j) * rig.TransformationsInverted[a];
+                    local.Decompose(out var sc, out var rot, out var tr);
+                    bones[i] = Copy(b, i, a);
+                    bones[i].Rotation = bones[i].AnimRotation = rot;
+                    bones[i].Translation = bones[i].AnimTranslation = tr;
+                    bones[i].Scale = bones[i].AnimScale = sc;
+                }
+                parents[i] = bones[i].ParentIndex;
+                // model-space inverse bind: head-space ones go through the head's (row vectors: model -> head -> bone)
+                inv[i] = head >= 0 ? rig.TransformationsInverted[head] * own.TransformationsInverted[j] : own.TransformationsInverted[j];
+            }
+            var hashes = new Dictionary<uint, ushort>();
+            var rh = BoneHashMap(rig); var oh = BoneHashMap(own);
+            if (rh != null) foreach (var kv in rh) hashes[kv.Key] = kv.Value;
+            if (oh != null) foreach (var kv in oh) if (!hashes.ContainsKey(kv.Key)) hashes[kv.Key] = (ushort)(nr + kv.Value);
+            jointBase = nr;
+            return MakeSkeleton(bones, parents, inv, hashes);
         }
 
         /// <summary>joaat(bone name) -> Bone.Tag for a skeleton read from a GTA VI drawable (null for other skeletons).</summary>
@@ -658,6 +767,7 @@ namespace CodeWalker.GameFiles
                         var m = DecodeVertices(r.G, gr.VO, gr.VS);
                         m.Indices = DecodeMeshlets(r.G, gr.MO, gr.MS, m.VertexCount);
                         m.Shader = gr.Shader;
+                        m.BoneHashes = gr.Bones;
                         if (m.Indices.Length > 0) list.Add(m);
                     }
                     outl[li][mi] = list;
@@ -666,19 +776,66 @@ namespace CodeWalker.GameFiles
             return outl;
         }
 
-        static Drawable Build(Res r, Item it)
+        static Drawable Build(Res r, Item it, Skeleton rig)
         {
             var meshes = Meshes(r, it.Root);
             var skel = ReadSkeleton(r, it.Root);
+            foreach (var lod in meshes)
+                if (lod != null) foreach (var mdl in lod) foreach (var m in mdl)
+                            if (m.Joints != null && m.Weights != null)
+                                for (int v = 0; v < m.Joints.Length; v++) if (m.Weights[v] != 0) it.MaxJoint = Math.Max(it.MaxJoint, m.Joints[v]);
+            int jointBase = 0;   // the meshes' blend indices start at this bone of skel
+            if (rig != null)
+            {
+                skel = BindToRig(rig, skel, it, out jointBase);
+                it.RigUse = skel == rig ? 1 : jointBase > 0 ? 2 : 0;
+            }
             int nbones = skel?.Bones?.Items?.Length ?? 0;
+            var hmap = BoneHashMap(skel);
+            var missing = new HashSet<uint>();
+            // a mesh's blend indices -> skeleton bones, as a bone palette on its geometries (the renderer uploads
+            // the palette's bone matrices, in order, for each geometry); null = the indices are skeleton indices
+            ushort[] Palette(Mesh m)
+            {
+                if (nbones == 0 || m.Joints == null) return null;
+                ushort[] p;
+                if (m.BoneHashes != null && hmap != null)
+                {
+                    p = new ushort[Math.Min(255, m.BoneHashes.Length)];
+                    for (int j = 0; j < p.Length; j++)
+                    {
+                        if (hmap.TryGetValue(m.BoneHashes[j], out var t)) p[j] = t;
+                        else { p[j] = 0; missing.Add(m.BoneHashes[j]); }
+                    }
+                }
+                else if (nbones > 255 || jointBase > 0)
+                {
+                    p = new ushort[Math.Min(255, nbones - jointBase)];
+                    for (int j = 0; j < p.Length; j++) p[j] = (ushort)(jointBase + j);
+                }
+                else return null;
+                bool identity = true;
+                for (int j = 0; j < p.Length && identity; j++) identity = p[j] == j;
+                if (identity && p.Length <= nbones) return null;
+                // the renderer only uses a palette whose length differs from the bone count
+                if (p.Length == nbones) Array.Resize(ref p, p.Length + 1);
+                return p;
+            }
             int maxShader = 0;
+            var palettes = new Dictionary<Mesh, ushort[]>();
             foreach (var lod in meshes)
                 if (lod != null) foreach (var mdl in lod) foreach (var m in mdl)
                         {
                             maxShader = Math.Max(maxShader, m.Shader + 1);
-                            if (nbones > 0) FixSkin(m, nbones);
+                            if (nbones > 0)
+                            {
+                                int range = m.BoneHashes != null && hmap != null ? m.BoneHashes.Length : nbones - jointBase;
+                                FixSkin(m, Math.Max(1, Math.Min(range, 255)));
+                                palettes[m] = Palette(m);
+                            }
                             else { m.Weights = null; m.Joints = null; }
                         }
+            it.MissingBones = missing.Count;
             var shaders = Shaders(r, it.Root, maxShader, it.TexRefs);
 
             var d = new Drawable
@@ -707,8 +864,11 @@ namespace CodeWalker.GameFiles
                     var bounds = new List<AABB_s>();
                     foreach (var m in mdl)
                     {
+                        int first = geoms.Count;
                         AddGeometries(m, shaders[m.Shader], geoms, bounds);
                         ntri += m.Indices.Length / 3;
+                        if (palettes.TryGetValue(m, out var pal) && pal != null)
+                            for (int gi = first; gi < geoms.Count; gi++) if (geoms[gi].VertexData?.VertexType == VertexType.PBBNCTX) geoms[gi].BoneIds = pal;
                     }
                     if (geoms.Count == 0) continue;
                     var shaderMap = new ushort[geoms.Count];
@@ -768,8 +928,9 @@ namespace CodeWalker.GameFiles
         }
 
         /// <summary>All drawables in a GTA VI .zdr/.zdd/.zft resource (data = CPU part then GPU part,
-        /// virtualSize = Rpf9FileEntry.VirtualSize). Drawables that fail to decode are skipped with a note.</summary>
-        public static List<Item> Read(byte[] data, long virtualSize, List<string> notes = null)
+        /// virtualSize = Rpf9FileEntry.VirtualSize). Drawables that fail to decode are skipped with a note.
+        /// rig: the character's skeleton from its rig .zft, for metaped parts (see <see cref="BindToRig"/>).</summary>
+        public static List<Item> Read(byte[] data, long virtualSize, List<string> notes = null, Skeleton rig = null)
         {
             var r = Split(data, virtualSize);
             var items = FindDrawables(r);
@@ -778,7 +939,7 @@ namespace CodeWalker.GameFiles
             {
                 try
                 {
-                    it.Drawable = Build(r, it);
+                    it.Drawable = Build(r, it, rig);
                     outl.Add(it);
                 }
                 catch (BadDataException ex) { notes?.Add((it.Name ?? "drawable") + ": " + ex.Message); }
