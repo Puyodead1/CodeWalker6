@@ -17,7 +17,7 @@ namespace CodeWalker.GameFiles
     /// LENM enum schemas, LSNS, LGID, LRSC, CHKS. Instance data is split into blocks, each holding a run of instances
     /// of one type; pointers are u64 with block = v &amp; 0xFFFFF (1-based) and byte offset = v &gt;&gt; 20.
     /// PRD0 keeps the schema and blocks as pointer tables in the CPU half of a resource instead.
-    /// Names: psin_names.txt (one name per line), registered under joaat(lowercase) and joaat(as written).
+    /// Names: the GTA VI hash list (strings_gta6.txt, see <see cref="Rpf9Strings"/>).
     /// </summary>
     public class Rpf9Psin
     {
@@ -60,7 +60,6 @@ namespace CodeWalker.GameFiles
         static bool IsEnum(int k) => k == 0x60 || k == 0x62 || k == 0x63 || k == 0x67;
 
         readonly byte[] b;
-        readonly Dictionary<uint, string> names;
         readonly Dictionary<uint, StructDef> structs = new Dictionary<uint, StructDef>();
         readonly List<uint> order = new List<uint>();
         readonly Dictionary<uint, Dictionary<long, uint>> enums = new Dictionary<uint, Dictionary<long, uint>>();
@@ -69,10 +68,9 @@ namespace CodeWalker.GameFiles
         HashSet<long> seen = new HashSet<long>();
         public List<string> Warnings { get; } = new List<string>();
 
-        Rpf9Psin(byte[] data, Dictionary<uint, string> nameMap)
+        Rpf9Psin(byte[] data)
         {
             b = data;
-            names = nameMap ?? new Dictionary<uint, string>();
         }
 
         // ---------------------------------------------------------------- public API
@@ -90,14 +88,18 @@ namespace CodeWalker.GameFiles
         }
 
         /// <summary>true if the file is PSIN or PRD0 metadata this class can turn into XML</summary>
-        public static bool IsMetadata(byte[] data, Rpf9FileEntry e) => IsPsin(data) || (e != null && e.IsResource && IsPrd0(CpuPart(data, e)));
+        public static bool IsMetadata(byte[] data, Rpf9FileEntry e) => IsPsin(data) || Rpf9Rbf.IsRbf0(data) || (e != null && e.IsResource && IsPrd0(CpuPart(data, e)));
 
-        /// <summary>XML for a PSIN file or a PRD0 resource, or null if it's neither. Throws on a broken file.</summary>
+        /// <summary>XML for a PSIN file (LSCH or PSCH schema), an RBF0 file or a PRD0 resource, or null if it's none of those.
+        /// Throws on a broken file.</summary>
         public static string ToXml(byte[] data, Rpf9FileEntry e = null)
         {
+            Rpf9Strings.EnsureLoaded();
+            if (Rpf9Rbf.IsRbf0(data)) return Rpf9Rbf.ToXml(data);
+            if (Rpf9Pso.IsPso(data)) return Rpf9Pso.ToXml(data);
             if (IsPsin(data))
             {
-                var ps = new Rpf9Psin(data, Names);
+                var ps = new Rpf9Psin(data);
                 ps.InitPsin();
                 var r = ps.Root(out long at);
                 return ps.Document(r, at);
@@ -105,65 +107,14 @@ namespace CodeWalker.GameFiles
             var cpu = CpuPart(data, e);
             if (IsPrd0(cpu))
             {
-                var ps = new Rpf9Psin(cpu, Names);
+                var ps = new Rpf9Psin(cpu);
                 var r = ps.InitPrd0(out long at);
                 return ps.Document(r, at);
             }
             return null;
         }
 
-        // ---------------------------------------------------------------- names
-
-        static Dictionary<uint, string> names_;
-        static readonly object namesLock = new object();
-        /// <summary>set before first use to override the psin_names.txt search</summary>
-        public static string NamesFile;
-
-        public static Dictionary<uint, string> Names
-        {
-            get
-            {
-                lock (namesLock)
-                {
-                    if (names_ != null) return names_;
-                    var d = new Dictionary<uint, string>();
-                    var fn = NamesFile ?? FindNamesFile();
-                    if (fn != null)
-                    {
-                        foreach (var line in File.ReadLines(fn, Encoding.UTF8))
-                        {
-                            var w = line.Trim();
-                            if (w.Length == 0) continue;
-                            uint h = Joaat(w);
-                            if (!d.ContainsKey(h)) d[h] = w;
-                            if (w != w.ToLowerInvariant())
-                            {
-                                h = Joaat(w, false);
-                                if (!d.ContainsKey(h)) d[h] = w;
-                            }
-                        }
-                        NamesFile = fn;
-                    }
-                    names_ = d;
-                    return d;
-                }
-            }
-        }
-
-        static string FindNamesFile()
-        {
-            var c = new List<string>();
-            var np = Rpf9Keys.NamesPath;
-            if (!string.IsNullOrEmpty(np))
-            {
-                var dir = Path.GetDirectoryName(Path.GetFullPath(np));
-                c.Add(Path.Combine(dir, "psin_names.txt"));
-                var up = Path.GetDirectoryName(dir);
-                if (up != null) c.Add(Path.Combine(up, "psin_names.txt"));
-            }
-            c.Add(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "psin_names.txt"));
-            return c.FirstOrDefault(File.Exists);
-        }
+        // ---------------------------------------------------------------- names: the hash list (strings_gta6.txt via Rpf9Strings)
 
         /// <summary>RAGE one-at-a-time hash; lower = hash the lowercased string (data values), else as written (schema names)</summary>
         public static uint Joaat(string s, bool lower = true)
@@ -182,9 +133,9 @@ namespace CodeWalker.GameFiles
             return h + (h << 15);
         }
 
-        string Name(uint h) => names.TryGetValue(h, out var n) && !string.IsNullOrEmpty(n) ? n : "hash_" + h.ToString("X8");
+        static string Name(uint h) => Rpf9Strings.Get(h) ?? "hash_" + h.ToString("X8");
         static readonly Regex TagRx = new Regex(@"^[A-Za-z_][\w.-]*$", RegexOptions.Compiled);
-        string Tag(uint h) => names.TryGetValue(h, out var n) && !string.IsNullOrEmpty(n) && TagRx.IsMatch(n) ? n : "hash_" + h.ToString("X8");
+        static string Tag(uint h) { var n = Rpf9Strings.Get(h); return n != null && TagRx.IsMatch(n) ? n : "hash_" + h.ToString("X8"); }
 
         // ---------------------------------------------------------------- byte access
 

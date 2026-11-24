@@ -1648,7 +1648,7 @@ namespace CodeWalker
                 string x9 = null;
                 try { x9 = Rpf9Psin.ToXml(data, f9); }
                 catch (Exception ex) { errorAction("Unable to convert file to XML: " + file.Path + " (" + ex.Message + ")"); return null; }
-                if (x9 == null) { errorAction("Not PSIN/PRD0 metadata: " + file.Path); return null; }
+                if (x9 == null) { errorAction("Not GTA VI metadata (PSIN/PSO/RBF0/PRD0): " + file.Path); return null; }
                 newfn = f9.Name + ".xml";
                 return x9;
             }

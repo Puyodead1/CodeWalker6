@@ -224,6 +224,22 @@ namespace CodeWalker.GameFiles
             return true;
         }
 
+        /// <summary>Registers str under a hash computed elsewhere (e.g. joaat of its lowercase form, keeping the original
+        /// casing for display).</summary>
+        public static bool Ensure(string str, uint hash)
+        {
+            if (hash == 0) return true;
+            lock (syncRoot)
+            {
+                if (!Index.ContainsKey(hash))
+                {
+                    Index.Add(hash, str);
+                    return false;
+                }
+            }
+            return true;
+        }
+
         public static string GetString(uint hash)
         {
             string res;

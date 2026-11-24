@@ -334,46 +334,8 @@ namespace CodeWalker.GameFiles
 
         // ------------------------------------------------------------------ materials
 
-        static Dictionary<uint, string> shaderNames;
-        public static Dictionary<uint, string> ShaderNames
-        {
-            get
-            {
-                if (shaderNames != null) return shaderNames;
-                var d = new Dictionary<uint, string>();
-                foreach (var n in ("standard weapon standard_glass standard_emissive standard_emissive_layer standard_dirt ped_standard " +
-                    "ped_standard_cutout ped_standard_eye ped_standard_head ped_standard_lod ped_standard_lod_skin ped_standard_animal " +
-                    "ped_standard_muv ped_standard_muv_secmo ped_standard_lod_muv standard_rdp ped_standard_muv_alpha " +
-                    "standard_2lyr_interior ped_standard_iridescence ped_standard_lod_muv_alpha weapon_muv_alpha " +
-                    "ped_standard_sheen_iridescence ped_standard_eye_cap_decal ped_standard_secmo").Split(' '))
-                    d[JenkHash.GenHash(n)] = n;
-                try
-                {
-                    var dirs = new List<string>();
-                    var np = Rpf9Keys.NamesPath;
-                    if (!string.IsNullOrEmpty(np))
-                    {
-                        var dd = Path.GetDirectoryName(Path.GetFullPath(np));
-                        dirs.Add(dd);
-                        var pd = Path.GetDirectoryName(dd);
-                        if (pd != null) { dirs.Add(Path.Combine(pd, "data")); dirs.Add(pd); }
-                    }
-                    dirs.Add(AppDomain.CurrentDomain.BaseDirectory);
-                    foreach (var dir in dirs)
-                    {
-                        var f = Path.Combine(dir, "shader_names.txt");
-                        if (!File.Exists(f)) continue;
-                        foreach (var n in File.ReadAllText(f).Split(new[] { ' ', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
-                            d[JenkHash.GenHash(n.ToLowerInvariant())] = n;
-                        break;
-                    }
-                }
-                catch { }
-                foreach (var n in d.Values) JenkIndex.Ensure(n);
-                shaderNames = d;
-                return d;
-            }
-        }
+        /// <summary>shader name from the hash list (strings_gta6.txt), or null</summary>
+        public static string ShaderName(uint h) => Rpf9Strings.Get(h);
 
         /// <summary>A shader's texture reference: slot in the shader's texture list, joaat(texture name), 64-bit
         /// texture key (= TTDB hash for streamed textures, 0 if none).</summary>
@@ -431,8 +393,7 @@ namespace CodeWalker.GameFiles
 
         static ShaderFX MakeShader(uint h)
         {
-            var names = ShaderNames;
-            names.TryGetValue(h, out var nm);
+            var nm = ShaderName(h);
             var sh = new ShaderFX
             {
                 Name = new MetaHash(h),
