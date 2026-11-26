@@ -401,8 +401,13 @@ namespace CodeWalker.GameFiles
             Loaded = true;
         }
 
+        /// <summary>
+        /// archive entry names: every name in strings_gta6.txt under its RPF9 name hash (Rpf9Strings, like GTA V's
+        /// strings.txt), plus an optional extra "hash TAB name" list (--names=)
+        /// </summary>
         static void LoadNames(string namesPath)
         {
+            foreach (var kv in Rpf9Strings.Names64) Names[kv.Key] = kv.Value;
             if (string.IsNullOrEmpty(namesPath) || !File.Exists(namesPath)) return;
             foreach (var line in File.ReadLines(namesPath))
             {

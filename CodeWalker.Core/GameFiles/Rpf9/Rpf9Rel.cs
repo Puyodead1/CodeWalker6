@@ -173,29 +173,8 @@ namespace CodeWalker.GameFiles
 
         // ------------------------------------------------------------------ names
 
-        static Dictionary<uint, string> relNames;
-
-        /// <summary>namelists\rel_names.tsv (next to the loaded rpf9_names.tsv): hash TAB name TAB source</summary>
-        static Dictionary<uint, string> RelNames()
-        {
-            if (relNames != null) return relNames;
-            var d = new Dictionary<uint, string>();
-            try
-            {
-                var dir = string.IsNullOrEmpty(Rpf9Keys.NamesPath) ? null : Path.GetDirectoryName(Rpf9Keys.NamesPath);
-                var f = dir == null ? null : Path.Combine(dir, "rel_names.tsv");
-                if (f != null && File.Exists(f))
-                    foreach (var line in File.ReadLines(f))
-                    {
-                        var c = line.Split('\t');
-                        if (c.Length >= 2 && c[0] != "hash" && uint.TryParse(c[0], System.Globalization.NumberStyles.HexNumber, null, out uint h)) d[h] = c[1];
-                    }
-            }
-            catch { }
-            return relNames = d;
-        }
-
-        static string Nm(uint h) => RelNames().TryGetValue(h, out var s) ? s : (Rpf9Strings.Get(h) ?? "0x" + h.ToString("X8"));
+        // .rel names are joaat(lower case name): they are in strings_gta6.txt (Rpf9Strings / JenkIndex)
+        static string Nm(uint h) => Rpf9Strings.Get(h) ?? "0x" + h.ToString("X8");
 
         static uint Joaat(string s)
         {
@@ -216,11 +195,10 @@ namespace CodeWalker.GameFiles
         {
             var r = new Rpf9Rel(data, name);
             var sb = new StringBuilder();
-            var names = RelNames();
             sb.AppendLine($"{name}: GTA VI audio metadata, {r.TypeName} (type {r.TypeId}) version {r.Version}, schema {r.Schema}, state {r.State}");
             sb.AppendLine($"data {r.Data.Length:N0} bytes; hash groups {r.Groups.Count} ({r.GroupHashes} hashes); bank strings {r.Strings.Count} ({(r.Encrypted ? "XXTEA" : "plain")}); objects {r.Index.Count:N0}; index2 {r.Index2}");
             sb.AppendLine($"fixups: hash {r.HashFixups.Count}, string {r.StringFixups.Count}, object {r.ObjectFixups.Count}, ext objects {r.ExtObjects.Count}, ext refs {r.ExtFixups.Count}; parsed to {r.End:N0} of {data.Length:N0} bytes");
-            sb.AppendLine($"named objects {r.Index.Count(i => names.ContainsKey(i.Hash)):N0} of {r.Index.Count:N0} (namelists\\rel_names.tsv{(names.Count == 0 ? " not found" : "")})");
+            sb.AppendLine($"named objects {r.Index.Count(i => Rpf9Strings.Get(i.Hash) != null):N0} of {r.Index.Count:N0} (strings_gta6.txt)");
             sb.AppendLine("Format: data\\audio_rel_format.md; full dump: tools\\audio_rel.py dump.");
             sb.AppendLine();
 
@@ -251,7 +229,7 @@ namespace CodeWalker.GameFiles
                 if (i < 0 || d + 8 > r.Data.Length) continue;
                 uint bh = BitConverter.ToUInt32(r.Data, (int)d), w = BitConverter.ToUInt32(r.Data, (int)d + 4);
                 string bank = byHash.TryGetValue(bh, out var bs) ? bs : "?" + bh.ToString("x8");
-                string wn = names.TryGetValue(w, out var x) ? x : null;
+                string wn = Rpf9Strings.Get(w);
                 var key = offs[i];
                 if (!waves.TryGetValue(key, out var l)) waves[key] = l = new List<string>();
                 l.Add($"{bank} wave {w:x8} (id {w & 0x1FFFFFFF:x8}){(wn != null ? " " + wn : "")}");

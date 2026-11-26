@@ -160,14 +160,13 @@ namespace CodeWalker
             WriteGta6Config("exe", exe);
         }
 
+        /// <summary>
+        /// an extra "hash TAB name" list given with --names=, or null. The names themselves come from strings_gta6.txt
+        /// next to CodeWalker.Core.dll (Rpf9Strings), like GTA V's strings.txt.
+        /// </summary>
         public static string FindGta6Names()
         {
-            var cands = new List<string>();
-            if (!string.IsNullOrEmpty(Gta6Names)) cands.Add(Gta6Names);
-            cands.Add(Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "rpf9_names.tsv"));
-            var exe = Gta6Exe ?? FindGta6Exe();
-            if (exe != null) cands.Add(Path.Combine(Path.GetDirectoryName(exe), @"..\namelists\rpf9_names.tsv"));
-            return cands.FirstOrDefault(File.Exists);
+            return !string.IsNullOrEmpty(Gta6Names) && File.Exists(Gta6Names) ? Gta6Names : null;
         }
 
         /// <summary>GTA V Legacy (gen9 false), GTA V Enhanced (gen9 true) or GTA VI (gta6 true: .rpf files in RPF9 format)</summary>

@@ -20,7 +20,7 @@ namespace CodeWalker.RPFExplorer
             //Process.Start("CodeWalker.exe", "explorer");
 
             // Open a game folder for this session only (the saved folder is unchanged):
-            //   GTA VI: "CodeWalker RPF Explorer.exe" <folder with RPF9 archives> [--exe=<game_scarlett_master.exe>] [--names=<rpf9_names.tsv>]
+            //   GTA VI: "CodeWalker RPF Explorer.exe" <folder with RPF9 archives> [--exe=<game_scarlett_master.exe>] [--names=<extra hash TAB name list>]
             //   GTA V:  "CodeWalker RPF Explorer.exe" <folder with GTA5.exe / gta5_enhanced.exe> [--legacy | --enhanced]
             bool? gen9 = null;
             if (args.Contains("--legacy")) gen9 = false;
