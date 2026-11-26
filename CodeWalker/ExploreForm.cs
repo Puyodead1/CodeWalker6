@@ -234,34 +234,37 @@ namespace CodeWalker
 
         private void InitGta6()
         {
-            //GTA VI: keys and cipher tables come from the game exe; no GTA V file cache
-            var exe = GTAFolder.FindGta6Exe();
-            if (exe == null)
+            //GTA VI keys (GTAFolder.FindGta6Keys): --exe=, the folder dialog's choice, gta6_keys.dat next to the app
+            //(plain AES keys, tools\gta6_keys.py), else lifted from the game exe by hash search; no GTA V file cache
+            var src = GTAFolder.FindGta6Keys();
+            if (src == null)
             {
                 using (var ofd = new OpenFileDialog())
                 {
-                    ofd.Title = "Select the GTA VI executable (game_scarlett_master.exe) to read the RPF9 keys from";
-                    ofd.Filter = "Executable (*.exe)|*.exe";
-                    if (ofd.ShowDialog(this) != DialogResult.OK) { UpdateStatus("GTA VI: no game exe selected."); return; }
-                    exe = ofd.FileName;
+                    ofd.Title = "GTA VI keys: select the game exe (game_scarlett_master.exe) or a key file (gta6_keys.dat)";
+                    ofd.Filter = "Game exe or key file (*.exe;*.dat)|*.exe;*.dat|All files (*.*)|*.*";
+                    if (ofd.ShowDialog(this) != DialogResult.OK) { UpdateStatus("GTA VI: no keys selected."); return; }
+                    src = ofd.FileName;
                 }
-                GTAFolder.SaveGta6Exe(exe);
+                GTAFolder.Gta6Keys = src;
             }
+            bool keyFile = GTAFolder.IsGta6KeyFile(src);
+            if (!keyFile && string.IsNullOrEmpty(GTAFolder.Gta6Exe)) GTAFolder.Gta6Exe = src; //names list lookup
             var names = GTAFolder.FindGta6Names();
             Task.Run(() =>
             {
                 try
                 {
-                    UpdateStatus("Loading GTA VI keys from " + exe + "...");
-                    Rpf9Keys.Load(exe, names);
-                    GTAFolder.Gta6Exe = exe;
+                    UpdateStatus("Loading GTA VI keys from " + src + "...");
+                    if (keyFile) Rpf9Keys.LoadKeyFile(src, names);
+                    else Rpf9Keys.Load(src, names);
                 }
                 catch (Exception ex)
                 {
-                    UpdateStatus("Unable to load GTA VI keys: " + ex.Message);
+                    UpdateStatus("Unable to load GTA VI keys from " + src + ": " + ex.Message);
                     return;
                 }
-                UpdateStatus(string.Format("{0} names, {1} TOC keys, {2} data keys. Scanning...", Rpf9Keys.Names.Count, Rpf9Keys.TocCiphers.Count, Rpf9Keys.DataCiphers.Count));
+                UpdateStatus(string.Format("{0} names, {1} TOC keys, {2} data keys ({3}). Scanning...", Rpf9Keys.Names.Count, Rpf9Keys.TocCiphers.Count, Rpf9Keys.DataCiphers.Count, keyFile ? "key file" : "lifted from the exe"));
 
                 RefreshMainTreeView();
 
@@ -376,6 +379,8 @@ namespace CodeWalker
             InitFileType(".zmf", "Manifest", 14);
             InitFileType(".zdr", "Drawable", 11, FileTypeAction.ViewModel);
             InitFileType(".zft", "Fragment", 11, FileTypeAction.ViewModel);
+            InitFileType(".zbn", "Collisions", 19, FileTypeAction.ViewModel);
+            InitFileType(".znv", "Navmesh", 9, FileTypeAction.ViewModel);
             InitFileType(".zdd", "Drawable Dictionary", 12, FileTypeAction.ViewModel);
             InitFileType(".ztd", "Texture Dictionary", 16, FileTypeAction.ViewYtd);
             InitFileType(".ttpf", "Texture Pack (TTDB)", 16, FileTypeAction.ViewYtd);
@@ -398,7 +403,7 @@ namespace CodeWalker
             InitFileType(".zpm", "Parameterized Motion", 18);
             InitFileType(".zed", "Expression Dictionary", 9);
             InitFileType(".zpt", "Particle Effect", 18);
-            InitFileType(".zmap", "Map Data", 21);
+            InitFileType(".zmap", "Map Data (PRD0)", 21, FileTypeAction.ViewXml, true);
             InitFileType(".ztyp", "Archetype Definitions (PRD0)", 20, FileTypeAction.ViewXml, true);
             InitFileType(".zch", "Clip Hierarchy", 18);
             InitFileType(".zldb", "Level Database", 9);
@@ -412,7 +417,7 @@ namespace CodeWalker
             InitFileType(".zwr", "Waypoint Record", 9);
             InitFileType(".znh", "Nav Hierarchy", 9);
             InitFileType(".zfd", "Frame Filter Dictionary", 9);
-            InitFileType(".zas", "Asset (PRD0)", 20);
+            InitFileType(".zas", "Anim Scene (PRD0)", 20, FileTypeAction.ViewXml, true);
             InitFileType(".zsm", "Secondary Motion", 9, FileTypeAction.ViewText);
             InitFileType(".zscript", "Script", 13);
             InitFileType(".zascript", "Script", 13);
@@ -433,13 +438,13 @@ namespace CodeWalker
             InitFileType(".zhdat", "ZHDAT", 9);
             InitFileType(".znmd", "ZNMD", 9);
             InitFileType(".zsmm", "ZSMM", 9);
-            InitFileType(".zascd", "Asset (PRD0, ZASCD)", 20);
+            InitFileType(".zascd", "Anim Scene Dictionary (PRD0)", 20, FileTypeAction.ViewXml, true);
             InitFileType(".zrd", "ZRD", 9);
             InitFileType(".zsmam", "Secondary Motion Asset Map", 9, FileTypeAction.ViewText);
             InitFileType(".zldbmt", "Level Database Metadata (PRD0)", 20, FileTypeAction.ViewXml, true);
             InitFileType(".zkit", "Kit (PRD0)", 20, FileTypeAction.ViewXml, true);
             InitFileType(".zcgc", "ZCGC", 9);
-            InitFileType(".zcov", "ZCOV", 9);
+            InitFileType(".zcov", "Cover Regions (PRD0)", 20, FileTypeAction.ViewXml, true);
             InitFileType(".bin", "File", 4);
         }
         private void InitFileType(string ext, string name, int imgidx, FileTypeAction defaultAction = FileTypeAction.ViewHex, bool xmlConvertible = false)
@@ -1641,6 +1646,18 @@ namespace CodeWalker
             var fentry = file?.File;
             if (fentry is Rpf9FileEntry f9)
             {
+                //GTA VI audio (ADAT): the sounds go into <folder>\<name>\, the "xml" is the stream index
+                if (Rpf9Awc.IsAwc(data))
+                {
+                    if (string.IsNullOrEmpty(outputFolder)) { errorAction("Audio export needs a folder: " + file.Path); return null; }
+                    try
+                    {
+                        var stem = Path.GetFileNameWithoutExtension(f9.Name);
+                        newfn = stem + "_index.tsv";
+                        return Rpf9Awc.Export(data, Path.Combine(outputFolder, stem));
+                    }
+                    catch (Exception ex) { errorAction("Unable to export audio: " + file.Path + " (" + ex.Message + ")"); return null; }
+                }
                 //GTA VI: PSIN / PRD0 metadata, or a plain text XML file
                 if (!Rpf9Psin.IsMetadata(data, f9) && IsTextXml(data))
                 {
@@ -1714,6 +1731,8 @@ namespace CodeWalker
         {
             if (item == null) return false;
             if (item.FileType == null) return false;
+            //GTA VI unnamed rows show as <hash>.bin: they may be audio (ADAT) or metadata, decided on export
+            if (item.File is Rpf9FileEntry f9 && (f9.NameLower ?? "").EndsWith(".bin")) return true;
             return item.FileType.XmlConvertible;
         }
 
@@ -1768,9 +1787,20 @@ namespace CodeWalker
 
                 if (fe is Rpf9FileEntry fe9)
                 {
-                    if ((fe9.NameLower ?? "").EndsWith(".zkit") && ViewGta6Kit(name, path, data, fe9)) return;
+                    if (Rpf9Awc.IsAwc(data)) { ViewRpf9Awc(name, path, data); return; }
+                    if (Rpf9Rel.IsRel(data, fe9.NameLower)) { ViewRpf9Rel(name, path, data, fe9); return; }
+                    if ((fe9.NameLower ?? "").EndsWith(".zad") && ViewRpf9Zad(name, path, data, fe9)) return;
+                    if ((fe9.NameLower ?? "").EndsWith(".zscript") && ViewRpf9Script(name, path, data, fe9)) return;
+                    if (Rpf9Zdatb.IsZdatb(data, fe9.NameLower) && ViewRpf9Zdatb(name, path, data, fe9)) return;
+                if ((fe9.NameLower ?? "").EndsWith(".zkit") && ViewGta6Kit(name, path, data, fe9)) return;
                     if (ViewRpf9Meta(name, path, data, fe9)) return;
                     if (ViewRpf9SecMotion(name, path, data, fe9)) return;
+                    if ((ft.DefaultAction == FileTypeAction.ViewHex) && IsPlainText(data)) //unnamed .bin that is really text
+                    {
+                        if (IsTextXml(data)) ViewXml(name, path, data, null);
+                        else ViewText(name, path, data, null);
+                        return;
+                    }
                     if (ft.DefaultAction == FileTypeAction.ViewXml && !IsTextXml(data)) { ViewRpf9Info(name, path, data, fe9); return; } //binary metadata that didn't decode
                     if (ft.DefaultAction == FileTypeAction.ViewHex) { ViewRpf9Info(name, path, data, fe9); return; } //no viewer: text summary
                 }
@@ -1918,6 +1948,19 @@ namespace CodeWalker
             int i = (data.Length >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF) ? 3 : 0;
             while (i < data.Length && (data[i] == ' ' || data[i] == '\t' || data[i] == '\r' || data[i] == '\n')) i++;
             return i < data.Length && data[i] == '<';
+        }
+        /// <summary>true when the first 4 KB are UTF-8 text: no control bytes other than tab / CR / LF, and no NULs</summary>
+        private static bool IsPlainText(byte[] data)
+        {
+            if ((data == null) || (data.Length == 0)) return false;
+            int n = Math.Min(data.Length, 4096);
+            for (int i = 0; i < n; i++)
+            {
+                byte b = data[i];
+                if ((b < 0x20) && (b != 9) && (b != 10) && (b != 13)) return false;
+                if (b == 0x7F) return false;
+            }
+            return true;
         }
         /// <summary>GTA VI PSIN / PRD0 metadata (any extension) -> decoded XML in the XML viewer. false if it isn't metadata.</summary>
         private bool ViewRpf9Meta(string name, string path, byte[] data, Rpf9FileEntry e)
@@ -2164,6 +2207,97 @@ namespace CodeWalker
         }
 
         /// <summary>GTA VI file without a viewer: a text summary (TOC facts, decoded headers, pointer/array/string census).</summary>
+        /// <summary>GTA VI audio wave container ('ADAT'): the AWC player (Opus decoded on play; the stream table is
+        /// on its XML tab). Falls back to the text table if the container can't be listed.</summary>
+        private void ViewRpf9Awc(string name, string path, byte[] data)
+        {
+            try
+            {
+                var sounds = Rpf9Awc.Sounds(data); //throws on a bad container, before any window opens
+                AwcForm af = new AwcForm();
+                af.Show();
+                af.LoadGta6(name, data, sounds);
+                return;
+            }
+            catch (Exception ex)
+            {
+                UpdateStatus(name + ": can't list the sounds (" + ex.Message + "), showing the stream table");
+            }
+            string txt;
+            Cursor = Cursors.WaitCursor;
+            try { txt = Rpf9Awc.Summary(data, name); }
+            catch (Exception ex) { txt = name + ": ADAT container not read: " + ex.Message; }
+            finally { Cursor = Cursors.Default; }
+            TextForm tf = new TextForm(this);
+            tf.Show();
+            tf.LoadReadOnlyText(name + ".txt", path, txt.Replace("\r\n", "\n").Replace("\n", "\r\n"));
+        }
+
+        /// <summary>GTA VI external animation dictionary (.zad): text view. False when it doesn't read (falls back).</summary>
+        private bool ViewRpf9Zad(string name, string path, byte[] data, Rpf9FileEntry e)
+        {
+            string txt;
+            Cursor = Cursors.WaitCursor;
+            try { txt = Rpf9Anim.AnimDictionarySummary(data, e.VirtualSize); }
+            catch (Exception) { return false; }
+            finally { Cursor = Cursors.Default; }
+            TextForm tf = new TextForm(this);
+            tf.Show();
+            tf.LoadReadOnlyText(name + ".txt", path, txt.Replace("\r\n", "\n").Replace("\n", "\r\n"));
+            return true;
+        }
+
+        /// <summary>GTA VI compiled script (.zscript): header, imports, disassembly. False when it doesn't read (falls back).</summary>
+        private bool ViewRpf9Script(string name, string path, byte[] data, Rpf9FileEntry e)
+        {
+            string txt;
+            Cursor = Cursors.WaitCursor;
+            try
+            {
+                var stems = new List<string>();
+                if (e.Parent?.Files != null)
+                    foreach (var f in e.Parent.Files)
+                    {
+                        var n = f.NameLower ?? "";
+                        if (n.EndsWith(".zscript")) stems.Add(n.Substring(0, n.Length - 8));
+                    }
+                txt = Rpf9Script.Summary(data, name, stems);
+            }
+            catch (Exception) { return false; }
+            finally { Cursor = Cursors.Default; }
+            TextForm tf = new TextForm(this);
+            tf.Show();
+            tf.LoadReadOnlyText(name + ".txt", path, txt.Replace("\r\n", "\n").Replace("\n", "\r\n"));
+            return true;
+        }
+
+        /// <summary>GTA VI fwdbStore data (.zdatb): blocks, slots, label records. False when it doesn't read.</summary>
+        private bool ViewRpf9Zdatb(string name, string path, byte[] data, Rpf9FileEntry e)
+        {
+            string txt;
+            Cursor = Cursors.WaitCursor;
+            try { txt = Rpf9Zdatb.Summary(data, name); }
+            catch (Exception) { return false; }
+            finally { Cursor = Cursors.Default; }
+            TextForm tf = new TextForm(this);
+            tf.Show();
+            tf.LoadReadOnlyText(name + ".txt", path, txt.Replace("\r\n", "\n").Replace("\n", "\r\n"));
+            return true;
+        }
+
+        /// <summary>GTA VI audio metadata (.rel): container summary, bank paths, objects with wave links.</summary>
+        private void ViewRpf9Rel(string name, string path, byte[] data, Rpf9FileEntry e)
+        {
+            string txt;
+            Cursor = Cursors.WaitCursor;
+            try { txt = Rpf9Rel.Summary(data, string.IsNullOrEmpty(e.NameLower) ? name : e.NameLower); }
+            catch (Exception ex) { txt = name + ": audio .rel not read: " + ex.Message + "\r\n\r\n" + Rpf9Info.Summary(e, data); }
+            finally { Cursor = Cursors.Default; }
+            TextForm tf = new TextForm(this);
+            tf.Show();
+            tf.LoadReadOnlyText(name + ".txt", path, txt.Replace("\r\n", "\n").Replace("\n", "\r\n"));
+        }
+
         private void ViewRpf9Info(string name, string path, byte[] data, Rpf9FileEntry e)
         {
             string txt;
@@ -2495,7 +2629,7 @@ namespace CodeWalker
         }
 
         /// <summary>GTA VI drawables in the model viewer: textures, clip dictionaries, secondary motion of the source entries, status line.</summary>
-        private void ShowGta6Model(string name, RpfFileEntry e, List<Rpf9Drawable.Item> items, List<string> notes, string rigNote, List<Rpf9FileEntry> secMotionSources)
+        private void ShowGta6Model(string name, RpfFileEntry e, List<Rpf9Drawable.Item> items, List<string> notes, string rigNote, List<Rpf9FileEntry> secMotionSources, Bounds bounds = null, string boundsNote = "")
         {
             int textured = 0, texShaders = 0;
             string texNote = "";
@@ -2520,6 +2654,7 @@ namespace CodeWalker
                 MessageBox.Show("No drawable this version understands." + (notes.Count > 0 ? "\n" + string.Join("\n", notes.Take(5)) : ""), name);
                 return;
             }
+            if (bounds != null && gf is YdrFile ydrb && ydrb.Drawable != null) ydrb.Drawable.Bound = bounds;
             ModelForm f9 = new ModelForm(this);
             f9.Show();
             if (gf is YdrFile ydr9) f9.LoadModel(ydr9);
@@ -2544,11 +2679,39 @@ namespace CodeWalker
             }
             if (smNotes.Count > 0) notes.AddRange(smNotes);
             int ntri = items.Sum(i => i.Triangles);
-            UpdateStatus(name + ": " + items.Count + " drawable(s), " + ntri.ToString("N0") + " triangles" + animNote + ", " + textured + "/" + texShaders + " shaders textured" + texNote + (notes.Count > 0 ? "; " + notes.Count + " notes: " + string.Join("; ", notes.Take(3)) : ""));
+            UpdateStatus(name + ": " + items.Count + " drawable(s), " + ntri.ToString("N0") + " triangles" + animNote + boundsNote + ", " + textured + "/" + texShaders + " shaders textured" + texNote + (notes.Count > 0 ? "; " + notes.Count + " notes: " + string.Join("; ", notes.Take(3)) : ""));
         }
 
         private void ViewModel(string name, string path, byte[] data, RpfFileEntry e)
         {
+            if (e is Rpf9FileEntry z9 && z9.NameLower.EndsWith(".zbn"))
+            {
+                //GTA VI physics bounds
+                Bounds bnd;
+                string bsum;
+                try { bnd = Rpf9Bounds.Read(data, (int)z9.VirtualSize, ".zbn", out bsum); }
+                catch (Exception ex) { MessageBox.Show("Couldn't read the bounds: " + ex.Message, name); ViewHex(name, path, data); return; }
+                if (bnd == null) { MessageBox.Show("No bound in this file.", name); ViewHex(name, path, data); return; }
+                var ybn9 = new YbnFile { Name = name, RpfFileEntry = e, Bounds = bnd, Loaded = true };
+                ModelForm fb = new ModelForm(this);
+                fb.Show();
+                fb.LoadModel(ybn9);
+                UpdateStatus(name + ": " + bsum + " (GTA VI material ids aren't mapped, so everything is grey)");
+                return;
+            }
+            if (e is Rpf9FileEntry n9 && n9.NameLower.EndsWith(".znv"))
+            {
+                //GTA VI navmesh
+                YnvFile ynv9;
+                Rpf9Navmesh.Info ninfo;
+                try { ynv9 = Rpf9Navmesh.Read(data, name, e, out ninfo); }
+                catch (Exception ex) { MessageBox.Show("Couldn't read the navmesh: " + ex.Message, name); ViewHex(name, path, data); return; }
+                ModelForm fn = new ModelForm(this);
+                fn.Show();
+                fn.LoadNavmesh(ynv9);
+                UpdateStatus(name + ": " + ninfo.Summary);
+                return;
+            }
             if (e is Rpf9FileEntry e9)
             {
                 //GTA VI drawable / drawable dictionary / fragment
@@ -2572,7 +2735,18 @@ namespace CodeWalker
                     ViewHex(name, path, data);
                     return;
                 }
-                ShowGta6Model(name, e, items, notes, rigNote, new List<Rpf9FileEntry> { e9 });
+                Bounds fragBound = null;
+                string fragBoundNote = "";
+                if (e9.NameLower.EndsWith(".zft"))
+                {
+                    try
+                    {
+                        fragBound = Rpf9Bounds.Read(data, (int)e9.VirtualSize, ".zft", out string bs);
+                        if (fragBound != null) fragBoundNote = ", collision: " + bs + " (tick Show collision meshes)";
+                    }
+                    catch (Exception ex) { notes.Add("bounds: " + ex.Message); }
+                }
+                ShowGta6Model(name, e, items, notes, rigNote, new List<Rpf9FileEntry> { e9 }, fragBound, fragBoundNote);
                 return;
             }
             var nl = e?.NameLower ?? "";
@@ -3135,7 +3309,8 @@ namespace CodeWalker
                 var nl = file?.File?.NameLower ?? file?.Name?.ToLowerInvariant();
                 if (!string.IsNullOrEmpty(nl))
                 {
-                    needfolder = nl.EndsWith(".ytd") || nl.EndsWith(".ydr") || nl.EndsWith(".ydd") || nl.EndsWith(".yft") || nl.EndsWith(".ypt") || nl.EndsWith(".awc") || nl.EndsWith(".fxc");
+                    needfolder = nl.EndsWith(".ytd") || nl.EndsWith(".ydr") || nl.EndsWith(".ydd") || nl.EndsWith(".yft") || nl.EndsWith(".ypt") || nl.EndsWith(".awc") || nl.EndsWith(".fxc")
+                        || (file.File is Rpf9FileEntry && nl.EndsWith(".bin")); //may be GTA VI audio (ADAT)
                 }
             }
 

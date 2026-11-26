@@ -56,7 +56,9 @@ namespace CodeWalker.GameFiles
         static Prim P(string n, int s, int a, char t, int c = 1) => new Prim { Name = n, Size = s, Align = a, T = t, N = c };
         static bool IsRaw(int k) => k == 0x44 || k == 0x42;                 // 16-byte string / object pointer
         static int RawSize(int k) => k == 0x44 ? 16 : 8;
-        static bool IsContainer(int k) => k == 0x53 || k == 0x05 || k == 0x50 || k == 0x52 || k == 0x5c || k == 0x75 || k == 0x71;
+        static bool IsContainer(int k) => k == 0x53 || k == 0x05 || k == 0x50 || k == 0x52 || k == 0x5c || k == 0x75 || k == 0x71
+            || k == 0x73 || k == 0x5e || k == 0x0a;
+        const ulong Owned = 1UL << 63;
         static bool IsEnum(int k) => k == 0x60 || k == 0x62 || k == 0x63 || k == 0x67;
 
         readonly byte[] b;
@@ -65,6 +67,8 @@ namespace CodeWalker.GameFiles
         readonly Dictionary<uint, Dictionary<long, uint>> enums = new Dictionary<uint, Dictionary<long, uint>>();
         readonly List<Block> blocks = new List<Block>();
         bool layoutExact = true;
+        int rootBlock;          // from LRSC (1-based), 0 = unknown (heuristic)
+        uint block1Type;        // block 1's real type; the decoder treats block 1 as untyped storage
         HashSet<long> seen = new HashSet<long>();
         public List<string> Warnings { get; } = new List<string>();
 
@@ -308,6 +312,29 @@ namespace CodeWalker.GameFiles
             ParseLsch(s["LSCH"].Key, s["LSCH"].Value);
             if (s.ContainsKey("LENM")) ParseLenm(s["LENM"].Key, s["LENM"].Value);
             long p = s["PSIN"].Key, ln = s["PSIN"].Value;
+            // LRSC = the 0x50-byte PRD0 header: +0x10 u64 root block (1-based), +0x38 u16 nStructs, nEnums, nBlocks.
+            // With it the block table at PSIN+8 is exactly nBlocks x {u32 type, u32 size, 8 x 0xAA} (parser sub_14407E700).
+            if (s.TryGetValue("LRSC", out var lr) && lr.Value >= 0x58 && b[lr.Key + 8] == '0' && b[lr.Key + 9] == 'D' && b[lr.Key + 10] == 'R' && b[lr.Key + 11] == 'P')
+            {
+                long o = lr.Key + 8;
+                ulong rb = U64(o + 0x10);
+                int nb = U16(o + 0x3C);
+                if (nb > 0 && p + 8 + 16L * nb <= p + ln)
+                {
+                    long qq = p + 8 + 16L * nb;
+                    block1Type = U32(p + 8);
+                    for (int i = 0; i < nb; i++)
+                    {
+                        uint h = U32(p + 8 + 16 * i), sz = U32(p + 12 + 16 * i);
+                        qq = (qq + 15) & ~15L;
+                        blocks.Add(new Block { Hash = i == 0 ? -1L : (long)h,Off = qq, Size = sz });
+                        qq += sz;
+                    }
+                    if (rb >= 1 && rb <= (ulong)nb) rootBlock = (int)rb;
+                    layoutExact = ((qq + 15) & ~15L) == p + ln;
+                    return;
+                }
+            }
             long blob = U32(p + 12);
             long q = p + 16;
             var ents = new List<KeyValuePair<uint, uint>>();
@@ -453,8 +480,9 @@ namespace CodeWalker.GameFiles
                 align = al;
                 return (n + al - 1) & ~(long)(al - 1);
             }
-            if (kind == 0x52 || kind == 0x5c || kind == 0x75) { align = 8; return 16; }
-            if (kind == 0x71) { align = 8; return 24; }
+            if (kind == 0x52 || kind == 0x5c || kind == 0x75 || kind == 0x73) { align = 8; return 16; }
+            if (kind == 0x71 || kind == 0x5e) { align = 8; return 24; }
+            if (kind == 0x0a) { align = 8; return 8; }
             align = 1; return -1;
         }
 
@@ -672,9 +700,46 @@ namespace CodeWalker.GameFiles
                 if (slots.Count != cnt) Warnings.Add("hashmap at 0x" + at.ToString("x") + ": " + slots.Count + " occupied slots, header says " + cnt);
                 return MapItems(fields, rf, slots, voff, tag, ind, depth);
             }
-            if (kind == 0x42)                                   // pointer to one object; type = the target block's type
+            if (kind == 0x5e)                                   // owned array: {u32 count, u32 capacity, ptr | 1 << 63, u64 0}
+            {
+                long cnt = U32(at);
+                ulong pv = U64(at + 8) & ~Owned;
+                if (cnt == 0) return pad + "<" + tag + "/>\n";
+                var f = fields[tword >> 16];
+                long es = SizeAlign(f.Kind, f.Ref, fields, f.Type, out _);
+                if (!Ptr(pv, out long lo, out long hi) || es < 0 || lo + cnt * es > hi)
+                {
+                    Warnings.Add("bad owned array ptr 0x" + pv.ToString("x") + " count " + cnt + " at 0x" + at.ToString("x"));
+                    return pad + "<" + tag + " count=\"" + cnt + "\" ptr=\"0x" + pv.ToString("X") + "\" error=\"unresolved\"/>\n";
+                }
+                return Items(fields, f.Kind, f.Type, f.Ref, lo, cnt, es, tag, ind, depth);
+            }
+            if (kind == 0x73)                                   // open hash map: {u32 capacity, u32 count, ptr}; key 0 = empty slot
+            {
+                long cap = U32(at), cnt = U32(at + 4);
+                ulong pv = U64(at + 8);
+                if (cnt == 0) return pad + "<" + tag + "/>\n";
+                bool okp = Ptr(pv, out long lo, out long hi);
+                bool okl = PairLayout(fields, (int)(rf & 0xffff), (int)(rf >> 16), out long voff, out long psz, out _);
+                if (!okp || !okl || lo + cap * psz > hi)
+                {
+                    Warnings.Add("bad openmap ptr 0x" + pv.ToString("x") + " capacity " + cap + " at 0x" + at.ToString("x"));
+                    return pad + "<" + tag + " count=\"" + cnt + "\" error=\"unresolved\"/>\n";
+                }
+                var slots = new List<long>();
+                for (long i = 0; i < cap; i++)
+                {
+                    long so = lo + i * psz;
+                    var key = Slice(so, so + voff);
+                    foreach (var kb in key) if (kb != 0) { slots.Add(so); break; }
+                }
+                if (slots.Count != cnt) Warnings.Add("openmap at 0x" + at.ToString("x") + ": " + slots.Count + " occupied slots, header says " + cnt);
+                return MapItems(fields, rf, slots, voff, tag, ind, depth);
+            }
+            if (kind == 0x42 || kind == 0x0a)                   // pointer to one object; type = the target block's type (0x0a: bit 63 = owned)
             {
                 ulong pv = U64(at);
+                if (kind == 0x0a) pv &= ~Owned;
                 if (pv == 0) return pad + "<" + tag + " ptr=\"null\"/>\n";
                 var d = Deref(pv, tag, ind, depth);
                 if (d != null) return d;
@@ -793,12 +858,37 @@ namespace CodeWalker.GameFiles
             return sb.Append(pad).Append("</").Append(tag).Append(">\n").ToString();
         }
 
+        /// <summary>CHKS = {u32 BE file size, u32 BE checksum, (len 20:) 0x7a 'ppp'}. Checksum = joaat over signed chars
+        /// (sub_144DD1900 / sub_144DD1920) of the first max(size, end of the section chain) bytes, clipped to the file,
+        /// with CHKS+8..+16 zeroed; seed 0x3FAC7125 when the section is 20 bytes long, else 0. Null without CHKS.</summary>
+        public static bool? ChksCheck(byte[] d, out uint size, out uint checksum)
+        {
+            size = checksum = 0;
+            var s = Sections(d);
+            if (!s.TryGetValue("CHKS", out var c) || c.Value < 16) return null;
+            long at = c.Key;
+            size = (uint)(d[at + 8] << 24 | d[at + 9] << 16 | d[at + 10] << 8 | d[at + 11]);
+            checksum = (uint)(d[at + 12] << 24 | d[at + 13] << 16 | d[at + 14] << 8 | d[at + 15]);
+            long end = s.Values.Max(v => v.Key + v.Value);
+            long n = Math.Min(Math.Max(size, end), d.LongLength);
+            uint h = c.Value == 20 ? 0x3FAC7125u : 0u;
+            for (long i = 0; i < n; i++)
+            {
+                int ch = (i >= at + 8 && i < at + 16) ? 0 : (sbyte)d[i];
+                h += (uint)ch; h += h << 10; h ^= h >> 6;
+            }
+            h *= 9; h ^= h >> 11; h *= 32769;
+            return h == checksum;
+        }
+
         string Document(StructDef st, long at)
         {
             seen = new HashSet<long> { at };
             var body = StructXml(st, at, Tag(st.Hash), 0, 0, true);
             var head = new StringBuilder("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
             if (!layoutExact) head.Append("<!-- warning: block layout did not match section length -->\n");
+            if (IsPsin(b) && ChksCheck(b, out uint csz, out uint csum) == false)
+                head.Append($"<!-- warning: CHKS checksum {csum:x8} (size {csz}) does not match: the file is damaged or truncated -->\n");
             foreach (var w in Warnings.Take(50)) head.Append("<!-- warning: ").Append(Esc(w).Replace("--", "- -")).Append(" -->\n");
             return head.Append(body).ToString();
         }
@@ -815,9 +905,10 @@ namespace CodeWalker.GameFiles
                     foreach (var f in st.Fields)
                         if (f.Name != ANON) Walk(st.Fields, f.Kind, f.Type, f.Ref, at + f.Off, refs, depth + 1);
             }
-            else if (kind == 0x07 || kind == 0x42)              // u64 slots are often untyped object pointers
+            else if (kind == 0x07 || kind == 0x42 || kind == 0x0a)  // u64 slots are often untyped object pointers
             {
                 ulong v = U64(at);
+                if (kind == 0x0a) v &= ~Owned;
                 if (v != 1 && Ptr(v, out long lo, out long hi) && lo < hi) refs.Add(new KeyValuePair<long, long>(lo, lo + 1));
             }
             else if (kind == 0x50)
@@ -854,10 +945,10 @@ namespace CodeWalker.GameFiles
                     refs.Add(new KeyValuePair<long, long>(lo, lo + (okl ? cnt * psz : 1)));
                 }
             }
-            else if (kind == 0x75)
+            else if (kind == 0x75 || kind == 0x73 || kind == 0x5e)
             {
                 long cnt = U32(at + 4);
-                ulong pv = U64(at + 8);
+                ulong pv = U64(at + 8) & ~Owned;
                 if (cnt != 0 && Ptr(pv, out long lo, out long hi)) refs.Add(new KeyValuePair<long, long>(lo, hi));
             }
         }
@@ -870,6 +961,12 @@ namespace CodeWalker.GameFiles
         /// </summary>
         StructDef Root(out long rootAt)
         {
+            if (rootBlock > 0)
+            {
+                // files with LRSC name the root block; the root is its first instance
+                long h = rootBlock == 1 ? block1Type : blocks[rootBlock - 1].Hash;
+                if (h >= 0 && structs.TryGetValue((uint)h, out var rs)) { rootAt = blocks[rootBlock - 1].Off; return rs; }
+            }
             var refs = new List<KeyValuePair<long, long>>();
             var typed = new List<KeyValuePair<StructDef, long>>();
             foreach (var bl in blocks.Skip(1))

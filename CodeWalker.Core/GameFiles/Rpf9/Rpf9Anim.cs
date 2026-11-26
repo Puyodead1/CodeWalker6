@@ -605,6 +605,72 @@ namespace CodeWalker.GameFiles
             return d > 0 ? n.Substring(0, d) : n;
         }
 
+        // ------------------------------------------------------------------ .zad (external animation dictionaries)
+
+        static readonly Dictionary<uint, string> TRACK_TYPES = new Dictionary<uint, string>
+        {
+            { 0x98e1750c, "boneRotation" }, { 0xf791a95f, "boneTranslation" }, { 0x7aaa9f60, "boneScale" },
+            { 0x2deefadd, "genericControl" }, { 0x60d0644c, "firstPersonCameraWeight" }, { 0x6ddef121, "cameraTranslation" },
+            { 0xf5c3a5b6, "genericTranslation" }, { 0x364d3bdb, "facialTranslation" }, { 0xd9ad1a74, "cameraRotation" },
+            { 0x4a5a04f4, "cameraFieldOfView" }, { 0x40243fdf, "cameraFocusDistance" },
+        };
+        static readonly Dictionary<uint, string> FORMATS = new Dictionary<uint, string> { { 0, "quat" }, { 2, "vec3" }, { 3, "vec2" }, { 4, "float" } };
+
+        /// <summary>A .zad: a stand-alone animation dictionary (same header as a .zcd, but the atMap at +0x48 holds
+        /// animations, keyed by joaat(anim name); +0x68 u32 joaat(dictionary name)). Cutscene time chunks: the sibling
+        /// &lt;stem&gt;.zcd lists it as animation dictionary ref N (= the -N suffix). See data/zad_format.md.</summary>
+        public static Dict ReadAnimDictionary(byte[] data, long virtualSize)
+        {
+            var r = new Res { C = Cpu(data, virtualSize) };
+            if (!IsClipDictionary(r)) Bad("not an animation dictionary");
+            var d = new Dict { Name = r.CStr(0x38) };
+            foreach (var kv in r.Map(0x48))
+            {
+                long a = kv.Value;
+                if (a < 0 || a + 0x70 > r.C.Length) continue;
+                var an = new Anim { Offset = a, Name = r.CStr(a + 0x30), Duration = r.F32(a + 0x28) };
+                try { DecodeAnimation(r, a, an); d.Decoded++; }
+                catch (Exception ex) when (ex is BadDataException || ex is ArgumentException || ex is IndexOutOfRangeException)
+                {
+                    an.Tracks.Clear(); an.Error = ex.Message; d.Failed++;
+                }
+                d.Anims.Add(an);
+            }
+            d.Anims.Sort((x, y) => string.CompareOrdinal(x.Name ?? "", y.Name ?? ""));
+            return d;
+        }
+
+        /// <summary>Text summary of a .zad: per animation its frames, blocks, flags and tracks grouped by type.</summary>
+        public static string AnimDictionarySummary(byte[] data, long virtualSize)
+        {
+            var r = new Res { C = Cpu(data, virtualSize) };
+            var d = ReadAnimDictionary(data, virtualSize);
+            var sb = new StringBuilder();
+            sb.AppendLine("Animation dictionary (.zad): " + d.Name + $"  (hash {r.U32(0x68):x8})");
+            sb.AppendLine($"{d.Anims.Count} animations ({d.Decoded} decoded, {d.Failed} failed)");
+            sb.AppendLine("A cutscene time chunk: the sibling <name without -N>.zcd lists it as animation dictionary ref N and streams it in by time (data/zad_format.md).");
+            sb.AppendLine();
+            foreach (var an in d.Anims)
+            {
+                long a = an.Offset;
+                uint flags = r.U32(a + 0x20);
+                int nb = r.Ptr(a + 0x50) >= 0 ? r.U16(a + 0x58) : 0;
+                sb.AppendLine($"{an.Name}");
+                sb.AppendLine($"    {r.U16(a + 0x24)} frames @ {an.Fps} fps ({an.Duration:0.###} s), {nb} block(s) of <= {r.U16(a + 0x26) + 1} frames, largest block {r.U32(a + 0x48)} B");
+                sb.AppendLine($"    flags {flags:x} (ref index {flags >> 16}{((flags & 0x10) != 0 ? ", root motion" : "")}), track set signature {r.U32(a + 0x2c):x8}");
+                if (an.Error != null) { sb.AppendLine("    DECODE FAILED: " + an.Error); continue; }
+                sb.AppendLine($"    tracks {an.Tracks.Count}, {an.Frames} decoded frames:");
+                foreach (var g in an.Tracks.GroupBy(t => (t.Type, t.Format)).OrderByDescending(g => g.Count()))
+                {
+                    string tn = TRACK_TYPES.TryGetValue(g.Key.Type, out var s) ? s : g.Key.Type.ToString("x8");
+                    string fn = FORMATS.TryGetValue(g.Key.Format, out var f) ? f : "fmt " + g.Key.Format;
+                    var ids = g.Select(t => t.Id == 0 ? "-" : (Rpf9Strings.Get(t.Id) ?? t.Id.ToString("x8"))).Take(8);
+                    sb.AppendLine($"      {tn}/{fn} x{g.Count()}: {string.Join(", ", ids)}{(g.Count() > 8 ? ", ..." : "")}");
+                }
+            }
+            return sb.ToString();
+        }
+
         /// <summary>Text summary for the file viewer: clips, their animations and decode status.</summary>
         public static string Summary(Dict d)
         {

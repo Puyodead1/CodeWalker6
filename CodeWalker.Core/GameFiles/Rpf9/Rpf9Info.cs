@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -27,7 +27,277 @@ namespace CodeWalker.GameFiles
             { ".zjd", "joint limit dictionary (JointLimitDictStore)" },
             { ".zmsk", "image mask (ImageMaskStore)" },
             { ".zmmd", "motion matcher data (MotionMatcherStore)" },
+            { ".zpm", "parameterized motion set: clips blended by 1..5 parameters" },
+            { ".zpt", "particle effect list (rage::ptxFxList): effect, emitter and particle rules" },
+            { ".zfd", "frame filter dictionary: weighted (bone, track) lists" },
+            { ".zrd", "rig dictionary: compiled RIG0 programs" },
+            { ".zpmd", "pose matcher data: poses sampled from clips" },
+            { ".zdatb", "binary data table (key, label rows)" },
+            { ".zasd", "relocatable object blob: object offset table, pointers tagged 71717171" },
         };
+
+        static ushort U16(Res r, int o) => BitConverter.ToUInt16(r.D, o);
+        static string AtString(Res r, int o)
+        {
+            int p = r.Ptr(o);
+            return p < 0 ? "" : Encoding.ASCII.GetString(r.D, p, Math.Min(U16(r, o + 8), r.Cpu - p));
+        }
+        /// <summary>element offsets of an atArray {ptr, u16 count, u16 capacity}</summary>
+        static List<int> AtArray(Res r, int o, int size)
+        {
+            var l = new List<int>();
+            int p = r.Ptr(o), n = U16(r, o + 8);
+            for (int i = 0; i < n && p >= 0; i++) l.Add(p + size * i);
+            return l;
+        }
+        /// <summary>entries of an atMap {ptr buckets, u32 bucket count, u32 0, u32 count}; next pointer is the entry's last u64</summary>
+        static List<int> AtMap(Res r, int o, int entrySize)
+        {
+            var l = new List<int>();
+            int tb = r.Ptr(o), nb = (int)r.U32(o + 8);
+            for (int i = 0; i < nb && tb >= 0; i++)
+                for (int e = r.Ptr(tb + 8 * i), guard = 0; e >= 0 && guard < 100000; e = r.Ptr(e + entrySize - 8), guard++) l.Add(e);
+            return l;
+        }
+
+        /// <summary>.zpm (v70), data\anim_format.md: set header 0xB0, motions 0x140 B, sampler nodes typed at +0x08</summary>
+        static void ParameterizedMotion(StringBuilder sb, Res r)
+        {
+            var dicts = AtArray(r, 0x70, 16).Select(e => r.U32(e + 8)).ToList();
+            var motions = AtMap(r, 0x48, 0x18);
+            sb.AppendLine($"Parameterized motion set {AtString(r, 0x38)} (hash {r.U32(0x68):x8}), {motions.Count} motions");
+            sb.AppendLine("  clip dictionaries: " + string.Join(", ", dicts.Select(Name)));
+            sb.AppendLine($"  shared data: {r.U32(0xA8)} bytes at +0x{Math.Max(r.Ptr(0xA0), 0):x}");
+            foreach (var me in motions)
+            {
+                int m = r.Ptr(me + 8);
+                if (m < 0) continue;
+                uint kind = r.U32(m + 0x58);
+                var clips = AtArray(r, m + 0x60, 16);
+                var curves = AtArray(r, m + 0x70, 0x28);
+                sb.AppendLine();
+                sb.AppendLine($"  motion {AtString(r, m + 0x30)} (key {r.U32(m + 0x28):x8}), kind {kind}, {r.U32(m + 0x5C)} parameters, {clips.Count} clips");
+                for (int i = 0; i < clips.Count; i++)
+                {
+                    uint d = r.U32(clips[i] + 12);
+                    string dur = i < curves.Count ? $", duration {r.F32(curves[i]):0.###} s, curve " + string.Join(" ",
+                        AtArray(r, curves[i] + 8, 8).Select(p => $"{r.F32(p):0.###}>{r.F32(p + 4):0.###}")) : "";
+                    sb.AppendLine($"    clip {i}: {Name(r.U32(clips[i] + 8))}, dictionary {dicts.IndexOf(d)}{dur}");
+                }
+                if (kind == 1)
+                {
+                    int n = r.Ptr(m + 0x138);
+                    if (n >= 0) sb.AppendLine("    " + SamplerNode(r, n));
+                }
+                else if (kind == 2)
+                {
+                    foreach (var reg in AtArray(r, m + 0x120, 0x38))
+                    {
+                        int n = r.Ptr(reg + 0x18);
+                        sb.AppendLine($"    region: clips {r.U32(reg + 0x20)}..{r.U32(reg + 0x20) + r.U32(reg + 0x24) - 1}" + (n >= 0 ? ", " + SamplerNode(r, n) : ""));
+                    }
+                }
+            }
+            sb.AppendLine();
+        }
+
+        /// <summary>16-byte string: inline when byte 15 has bit 7 (length in the low bits), else {char*, u16 len, u16 cap, u32}</summary>
+        static string SStr(Res r, int o)
+        {
+            byte t = r.D[o + 15];
+            return (t & 0x80) != 0 ? Encoding.ASCII.GetString(r.D, o, Math.Min(t & 0x7F, 15)) : CStr(r, o);
+        }
+        static readonly Dictionary<uint, string> TrackTypes = new Dictionary<uint, string>
+        {
+            { 0x98e1750c, "boneRotation" }, { 0xf791a95f, "boneTranslation" }, { 0x7aaa9f60, "boneScale" }, { 0x2deefadd, "genericControl" },
+            { 0x60d0644c, "firstPersonCameraWeight" }, { 0x6ddef121, "cameraTranslation" }, { 0xf5c3a5b6, "genericTranslation" },
+        };
+        /// <summary>pgDictionary at 0: (hash, item offset) pairs</summary>
+        static List<(uint, int)> PgDict(Res r) =>
+            AtArray(r, 0x20, 4).Zip(AtArray(r, 0x30, 8), (h, p) => (r.U32(h), r.Ptr(p))).ToList();
+
+        /// <summary>.zfd, data\animdata_formats.md: frame filters (0x40) with 0x30-byte (id, weight, track) entries</summary>
+        static void FrameFilters(StringBuilder sb, Res r)
+        {
+            var fs = PgDict(r);
+            sb.AppendLine($"Frame filter dictionary: {fs.Count} filters");
+            foreach (var (h, f) in fs.Where(x => x.Item2 >= 0))
+            {
+                var es = AtArray(r, f + 0x28, 0x30);
+                var tracks = es.GroupBy(e => r.U32(e + 0x28)).Select(g => $"{(TrackTypes.TryGetValue(g.Key, out var n) ? n : g.Key.ToString("x8"))} {g.Count()}");
+                sb.AppendLine($"  {SStr(r, f + 0x18)} ({h:x8}): {es.Count} entries, {es.Count(e => r.F32(e + 4) == 1f)} at weight 1; {string.Join(", ", tracks)}");
+            }
+            sb.AppendLine();
+        }
+
+        /// <summary>.zjd: joint limit sets (0x70) with 0x90-byte rotation limits</summary>
+        static void JointLimits(StringBuilder sb, Res r)
+        {
+            var js = PgDict(r);
+            sb.AppendLine($"Joint limit dictionary: {js.Count} sets");
+            foreach (var (h, o) in js.Where(x => x.Item2 >= 0))
+            {
+                int n = (int)r.U32(o + 0x18), lp = r.Ptr(o + 0x20);
+                sb.AppendLine($"  {SStr(r, o + 0x58)} ({h:x8}): {n} rotation limits");
+                for (int i = 0; i < n && lp >= 0; i++)
+                {
+                    int e = lp + 0x90 * i;
+                    uint cp = r.U32(e + 0x78);
+                    var pts = Enumerable.Range(0, (int)Math.Min(cp, 8)).Select(k => $"({r.F32(e + 0x18 + 12 * k):0.###} {r.F32(e + 0x1C + 12 * k):0.###} {r.F32(e + 0x20 + 12 * k):0.###})");
+                    sb.AppendLine($"    bone {Name(r.U32(e + 0x80))}: twist {r.F32(e + 0x10):0.###}..{r.F32(e + 0x14):0.###}, {cp} control points {string.Join(" ", pts)}");
+                }
+            }
+            sb.AppendLine();
+        }
+
+        static readonly Dictionary<uint, string> RigSections = new Dictionary<uint, string>
+        {
+            { 0xe636c3e9, "ops" }, { 0x2316833f, "inputs" }, { 0x7224f987, "outputs" }, { 0xb00f0959, "data" },
+            { 0x74d00508, "property fields" }, { 0x6257c371, "properties" },
+        };
+
+        /// <summary>.zrd: named dictionary of RIG\x02 blobs (RIG0 program with tagged sections)</summary>
+        static void Rigs(StringBuilder sb, Res r)
+        {
+            var items = AtMap(r, 0x48, 0x18);
+            sb.AppendLine($"Rig dictionary {SStr(r, 0x38)}: {items.Count} rigs");
+            foreach (var e in items)
+            {
+                int v = r.Ptr(e + 8), b = v < 0 ? -1 : r.Ptr(v + 0x20);
+                if (b < 0 || r.U32(b) != 0x02474952) { sb.AppendLine($"  {r.U32(e):x8}: no rig"); continue; }
+                int g = b + 0x100, ns = (int)r.U32(g + 0x10);
+                var secs = new List<string>();
+                string name = null; int ops = 0, ins = 0, outs = 0;
+                int fields = -1, props = -1;
+                for (int k = 0; k < ns; k++)
+                {
+                    int s = g + (int)r.U32(g + 0x14 + 4 * k);
+                    uint t = r.U32(s);
+                    if (t == 0xe636c3e9) ops = (int)r.U32(s + 8);
+                    else if (t == 0x2316833f) ins = (int)r.U32(s + 8);
+                    else if (t == 0x7224f987) outs = (int)r.U32(s + 8);
+                    else if (t == 0x74d00508) fields = s + 8;
+                    else if (t == 0x6257c371) props = s + 8;
+                    else secs.Add(t.ToString("x8"));
+                }
+                if (fields >= 0 && props >= 0)
+                    for (int i = 0; i < r.U32(fields); i++)
+                    {
+                        int f = fields + 4 + 8 * i;
+                        if (r.U32(f) == 0xc9e2bfa4) name = Encoding.ASCII.GetString(r.D, props + U16(r, f + 4), U16(r, f + 6)).TrimEnd('\0');
+                    }
+                sb.AppendLine($"  {name ?? r.U32(e).ToString("x8")}: " + (ops > 0 ? $"{ops} ops, {ins} inputs, {outs} outputs" : "table rig") + (secs.Count > 0 ? " + " + string.Join(" ", secs) : ""));
+            }
+            sb.AppendLine();
+        }
+
+        /// <summary>embedded crSkeletonData (0x80): bones 0x50 at +0x28, parents u16 at +0x40, count u16 at +0x6c</summary>
+        static string SkeletonBones(Res r, int s)
+        {
+            if (s < 0) return "";
+            int n = U16(r, s + 0x6C), bp = r.Ptr(s + 0x28);
+            return $"{n} bones: " + string.Join(" ", Enumerable.Range(0, bp < 0 ? 0 : n).Select(i => CStr(r, bp + 0x50 * i + 0x30)));
+        }
+
+        /// <summary>.zmmd: named dictionary of motion matchers (clip ranges, clip refs, skeleton)</summary>
+        static void MotionMatchers(StringBuilder sb, Res r)
+        {
+            var dicts = AtArray(r, 0x70, 16).Select(e => r.U32(e + 8)).ToList();
+            var items = AtMap(r, 0x48, 0x18);
+            sb.AppendLine($"Motion matchers {SStr(r, 0x38)}: {items.Count} matchers, clip dictionaries {string.Join(", ", dicts.Select(Name))}");
+            foreach (var e in items)
+            {
+                int v = r.Ptr(e + 8);
+                if (v < 0) continue;
+                int n = (int)r.U32(v + 0x50), cp = r.Ptr(v + 0x58);
+                var clips = Enumerable.Range(0, cp < 0 ? 0 : n).Select(i => r.U32(cp + 0x18 * i + 12)).Distinct().Count();
+                sb.AppendLine($"  {SStr(r, v + 0x38)}: {n} ranges over {clips} clips, {r.U32(v + 0x90)} clip refs");
+                int cfg = r.Ptr(v + 0x20);
+                if (cfg >= 0) sb.AppendLine("    " + SkeletonBones(r, r.Ptr(cfg + 0x28)));
+            }
+            sb.AppendLine();
+        }
+
+        /// <summary>.zpmd: named dictionary of pose matchers (poses referencing clip frames)</summary>
+        static void PoseMatchers(StringBuilder sb, Res r)
+        {
+            var items = AtMap(r, 0x48, 0x18);
+            sb.AppendLine($"Pose matchers {SStr(r, 0x38)}: {items.Count}");
+            foreach (var e in items)
+            {
+                int v = r.Ptr(e + 8);
+                if (v < 0) continue;
+                var poses = AtArray(r, v + 0x20, 8).Select(r.Ptr).Where(p => p >= 0).ToList();
+                sb.AppendLine($"  {SStr(r, v + 0x40)}: {poses.Count} poses, {AtArray(r, v + 0x30, 0x10).Count} weighted bones, frame time {r.F32(v + 0x68):0.#####}");
+                foreach (var p in poses) sb.AppendLine($"    clip {Name(r.U32(p + 4))} of {Name(r.U32(p))}, frame {r.U32(p + 12)}, weight {r.F32(p + 8):0.###}");
+                sb.AppendLine("    " + SkeletonBones(r, r.Ptr(v + 0x50)));
+            }
+            sb.AppendLine();
+        }
+
+        static string CStr(Res r, int o)
+        {
+            int p = r.Ptr(o);
+            if (p < 0) return "";
+            int e = p;
+            while (e < r.Cpu && r.D[e] != 0) e++;
+            return Encoding.ASCII.GetString(r.D, p, e - p);
+        }
+
+        /// <summary>particle behaviour mask bit -> name (data\particle_format.md); unnamed bits print as ?n</summary>
+        static readonly Dictionary<int, string> PtxBehaviours = new Dictionary<int, string>
+        {
+            { 1, "Age" }, { 2, "Acceleration" }, { 3, "Attractor" }, { 4, "Velocity" }, { 5, "Rotation" }, { 7, "Size" },
+            { 8, "Dampening" }, { 9, "MatrixWeight" }, { 12, "ZCull" }, { 16, "Collision" }, { 17, "AnimateTexture" },
+            { 19, "Colour" }, { 21, "Decal" }, { 23, "Light" }, { 24, "FogVolume" }, { 27, "Sprite" }, { 28, "Trail" }, { 29, "Model" },
+        };
+        static readonly string[] PtxDomainShapes = { "box", "sphere", "cylinder", "attractor", "texture" };
+
+        /// <summary>.zpt (v72), data\particle_format.md: rage::ptxFxList with effect, emitter and particle rule dictionaries</summary>
+        static void ParticleEffects(StringBuilder sb, Res r)
+        {
+            List<int> Rules(int slot) { int d = r.Ptr(slot); return d < 0 ? new List<int>() : AtArray(r, d + 0x30, 8).Select(r.Ptr).ToList(); }
+            int HashCount(int slot) => r.Ptr(slot) < 0 ? 0 : (int)r.U32(slot + 0x10);
+            var effects = Rules(0x28); var emitters = Rules(0x30); var particles = Rules(0x38);
+            sb.AppendLine($"Particle effect list {CStr(r, 0x10)}: {effects.Count} effects, {emitters.Count} emitters, {particles.Count} particle rules, {HashCount(0x40)} models, {HashCount(0x58)} domain textures");
+            sb.AppendLine();
+            foreach (var e in effects.Where(x => x >= 0))
+            {
+                sb.AppendLine($"effect {CStr(r, e + 0x20)}: duration {r.F32(e + 0x78):0.###}..{r.F32(e + 0x7C):0.###} s, loops {(int)r.U32(e + 0x50)}, cull distance {r.F32(e + 0xA8):0.#}");
+                foreach (var ev in AtArray(r, e + 0x38, 8).Select(r.Ptr).Where(x => x >= 0))
+                    sb.AppendLine($"  {r.F32(ev + 0x10):0.###}..{r.F32(ev + 0x14):0.###}: emitter {CStr(r, ev + 0x40)}, particle {CStr(r, ev + 0x48)}");
+            }
+            sb.AppendLine();
+            foreach (var e in emitters.Where(x => x >= 0))
+            {
+                var doms = new List<string>();
+                for (int k = 0; k < 3; k++)
+                {
+                    int d = r.Ptr(e + 0x30 + 8 * k);
+                    if (d < 0) continue;
+                    uint shape = r.U32(d + 0x18C);
+                    doms.Add(new[] { "creation", "target", "attractor" }[k] + " " + (shape < PtxDomainShapes.Length ? PtxDomainShapes[shape] : shape.ToString()));
+                }
+                sb.AppendLine($"emitter {CStr(r, e + 0x20)}: {string.Join(", ", doms)}{(r.D[e + 0x2F0] != 0 ? ", one shot" : "")}");
+            }
+            sb.AppendLine();
+            foreach (var p in particles.Where(x => x >= 0))
+            {
+                uint mask = r.U32(p + 0x180);
+                var bs = Enumerable.Range(0, 32).Where(k => (mask >> k & 1) != 0).Select(k => PtxBehaviours.TryGetValue(k, out var n) ? n : "?" + k);
+                sb.AppendLine($"particle {CStr(r, p + 0x178)}: {string.Join(" ", bs)}");
+                foreach (var m in AtArray(r, p + 0x3B0, 0x20)) sb.AppendLine("  model " + CStr(r, m));
+            }
+            sb.AppendLine();
+        }
+
+        static string SamplerNode(Res r, int n)
+        {
+            uint t = r.U32(n + 8);
+            if (t != 3) return $"sampler type {t} ({(t == 1 ? "single clip" : "multi-parameter grid in the shared data")})";
+            var pts = AtArray(r, n + 0x20, 8).Select(p => $"clip {r.U32(p)} at {r.F32(p + 4):0.####}");
+            return $"sampler type 3 (1D), range {r.F32(n + 0x30):0.####} .. {r.F32(n + 0x34):0.####}: " + string.Join(", ", pts);
+        }
 
         public static string Summary(Rpf9FileEntry e, byte[] data)
         {
@@ -52,6 +322,13 @@ namespace CodeWalker.GameFiles
                     case ".zcgc": ComputeGraphConstants(sb, r); break;
                     case ".zcps": ParameterTables(sb, r); break;
                     case ".ztsl": TangentLut(sb, r); break;
+                    case ".zpm": ParameterizedMotion(sb, r); break;
+                    case ".zpt": ParticleEffects(sb, r); break;
+                    case ".zfd": FrameFilters(sb, r); break;
+                    case ".zjd": JointLimits(sb, r); break;
+                    case ".zrd": Rigs(sb, r); break;
+                    case ".zmmd": MotionMatchers(sb, r); break;
+                    case ".zpmd": PoseMatchers(sb, r); break;
                 }
             }
             catch (Exception ex) { sb.AppendLine("Decode stopped: " + ex.Message); sb.AppendLine(); }

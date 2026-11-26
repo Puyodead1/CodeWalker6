@@ -187,14 +187,16 @@ namespace CodeWalker.GameFiles
             int b0 = (int)vo, len = (int)vs;
             uint U(int o) => BitConverter.ToUInt32(g, b0 + o);
             uint magic = U(0);
+            // slot word = (byte offset / 2) << 8 | format byte; element size = (format >> 5) * 4
             var slots = new List<int[]>(); // slot, offset, format
             int first = len;
             for (int i = 1; i <= 22; i++)
             {
                 uint w = U(4 * i);
                 if (w == 0) continue;
-                slots.Add(new[] { i, (int)(w >> 7), (int)(w & 0x7f) });
-                first = Math.Min(first, (int)(w >> 7));
+                int off = (int)(w >> 8) * 2, fmt = (int)(w & 0xff);
+                slots.Add(new[] { i, off, fmt });
+                first = Math.Min(first, off);
             }
             var m = new Mesh();
             int nv;
@@ -235,7 +237,8 @@ namespace CodeWalker.GameFiles
             foreach (var s in slots)
             {
                 int slot = s[0], o = s[1], fm = s[2];
-                int es = fm == 0x42 ? 8 : (fm == 0x63 && magic == 0x3063) ? 12 : 4;
+                int es = (fm >> 5) * 4;
+                if (es == 0) Bad("vertex format " + fm.ToString("x2"));
                 if ((long)o + (long)es * nv > len) Bad("stream past block end");
                 int p = b0 + o;
                 int uvi = Array.IndexOf(UV_SLOTS, slot);
@@ -289,6 +292,13 @@ namespace CodeWalker.GameFiles
                 {
                     j2 = new byte[4 * nv];
                     Buffer.BlockCopy(g, p, j2, 0, 4 * nv);
+                }
+                else if ((slot == 8 || slot == 9) && fm == 0x8c)
+                {
+                    // 4 x u32 blend indices per vertex (*_secmo shaders); the bone index is the low byte
+                    var jj = new byte[4 * nv];
+                    for (int v = 0; v < 4 * nv; v++) jj[v] = g[p + 4 * v];
+                    if (slot == 8) m.Joints = jj; else j2 = jj;
                 }
             }
             if (m.Weights != null && m.Joints != null && w2 != null && j2 != null) Keep4(m, w2, j2);
@@ -430,21 +440,34 @@ namespace CodeWalker.GameFiles
         {
             var res = new List<TexRef>();
             long ta = r.CPtr(s + 0x10);
-            for (int k = 0; ta >= 0 && k < 32; k++)
+            // parameter descriptor (shader +0x20): u8 cbuffer count, u8 texture count, ...
+            long d = r.CPtr(s + 0x20);
+            int ntex = (d >= 0 && d + 2 <= r.C.Length) ? r.C[d + 1] : 32;
+            for (int k = 0; ta >= 0 && k < ntex; k++)
             {
                 if (ta + 8 * k + 8 > r.C.Length) break;
                 long t = r.CPtr(ta + 8 * k);
-                if (t < 0)
+                if (t < 0) continue;   // unbound slot
+                if (t + 0x38 > r.C.Length || (r.U16(t + 0x10) & 0x1f80) != 0x980)
                 {
-                    if (r.U64(ta + 8 * k) != 0) break;
+                    if (d < 0) break;
                     continue;
                 }
-                if (t + 0x38 > r.C.Length || r.U16(t + 0x10) != 0x980) break;
-                long nr = r.CPtr(t + 0x30);
-                if (nr < 8) continue;
-                var tr = new TexRef { Shader = shader, Slot = k, Hash = r.U32(nr - 8) };
-                if (nr + 16 <= r.C.Length) tr.Key = r.U64(nr + 8);
-                res.Add(tr);
+                // +0x30 -> property list: nodes {u64 next | tag (low 3 bits), payload at +8};
+                // tag 5 = u64 texture key, tag 6 = u32 joaat(texture name)
+                var tr = new TexRef { Shader = shader, Slot = k };
+                bool any = false;
+                long p = r.CPtr(t + 0x30);
+                for (int i = 0; i < 16 && p >= 0 && p + 16 <= r.C.Length; i++)
+                {
+                    ulong w = r.U64(p);
+                    int tag = (int)(w & 7);
+                    if (tag == 5) { tr.Key = r.U64(p + 8); any = true; }
+                    else if (tag == 6) { tr.Hash = r.U32(p + 8); any = true; }
+                    ulong nx = w & ~7UL;
+                    p = (nx >= P_CPU && nx < P_CPU + (ulong)r.C.Length) ? (long)(nx - P_CPU) : -1;
+                }
+                if (any) res.Add(tr);
             }
             return res;
         }

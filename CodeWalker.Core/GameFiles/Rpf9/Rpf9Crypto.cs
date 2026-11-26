@@ -68,10 +68,171 @@ namespace CodeWalker.GameFiles
             }
             return res;
         }
+
+        /// <summary>
+        /// The address of the first 16-byte aligned region of len bytes whose first 16 bytes have FNV-1a hash fnv and whose
+        /// SHA-1 is sha1, or 0 (the same idea as GTA5Keys' hash search of GTA5.exe, so a rebuilt exe works as long as the
+        /// tables themselves are unchanged)
+        /// </summary>
+        public ulong FindHashed(uint fnv, byte[] sha1, int len)
+        {
+            using (var sha = System.Security.Cryptography.SHA1.Create())
+            {
+                foreach (var sec in Sections)
+                {
+                    long end = Math.Min((long)sec[2] + sec[3], Data.Length) - len;
+                    for (long i = sec[2]; i <= end; i += 16)
+                    {
+                        uint h = 2166136261;
+                        for (int j = 0; j < 16; j++) h = (h ^ Data[i + j]) * 16777619;
+                        if (h != fnv) continue;
+                        var s = sha.ComputeHash(Data, (int)i, len);
+                        bool same = true;
+                        for (int j = 0; j < 20 && same; j++) same = s[j] == sha1[j];
+                        if (same) return ImageBase + sec[0] + (ulong)(i - sec[2]);
+                    }
+                }
+            }
+            return 0;
+        }
+
+        /// <summary>
+        /// The key table {u32 type &lt;&lt; 24, u32 key id, u64 blob address, u64 length}: the longest run of such records
+        /// that includes one pointing at a known key blob. Returns its address and row count, or 0.
+        /// </summary>
+        public ulong FindKeyTable(ICollection<ulong> blobVas, out int rows)
+        {
+            var set = new HashSet<ulong>(blobVas);
+            ulong best = 0;
+            rows = 0;
+            foreach (var sec in Sections)
+            {
+                long lo = sec[2], hi = Math.Min((long)sec[2] + sec[3], Data.Length);
+                for (long i = lo + 8; i + 16 <= hi; i += 8)
+                {
+                    if (!set.Contains(BitConverter.ToUInt64(Data, (int)i))) continue;
+                    long r = i - 8;
+                    if (!IsKeyRecord(r, lo, hi)) continue;
+                    while (IsKeyRecord(r - 24, lo, hi)) r -= 24;
+                    int n = 0;
+                    while (IsKeyRecord(r + 24L * n, lo, hi)) n++;
+                    if (n > rows) { rows = n; best = ImageBase + sec[0] + (ulong)(r - lo); }
+                    i = r + 24L * n; // past this run
+                }
+            }
+            return best;
+        }
+
+        bool IsKeyRecord(long r, long lo, long hi)
+        {
+            if (r < lo || r + 24 > hi) return false;
+            if ((BitConverter.ToUInt32(Data, (int)r) & 0xFFFFFF) != 0) return false;
+            ulong ptr = BitConverter.ToUInt64(Data, (int)r + 8), len = BitConverter.ToUInt64(Data, (int)r + 16);
+            return ptr >= ImageBase && ptr < ImageBase + 0x10000000 && len > 0 && len <= 0x10000;
+        }
+    }
+
+    /// <summary>An AES-256 block function (one direction) with the CBC-decrypt and CTR modes the archives use.</summary>
+    public abstract class Rpf9Cipher
+    {
+        public abstract void Block(byte[] b, int bo, byte[] o, int oo);
+
+        /// <summary>CBC decryption (type 16); a trailing partial block is copied as-is</summary>
+        public virtual byte[] DecryptCbc(byte[] data, int off, int len, byte[] iv)
+        {
+            var res = new byte[len];
+            var prev = (byte[])iv.Clone();
+            var blk = new byte[16];
+            int full = len & ~15;
+            for (int i = 0; i < full; i += 16)
+            {
+                Block(data, off + i, blk, 0);
+                for (int j = 0; j < 16; j++) res[i + j] = (byte)(blk[j] ^ prev[j]);
+                Buffer.BlockCopy(data, off + i, prev, 0, 16);
+            }
+            Buffer.BlockCopy(data, off + full, res, full, len - full);
+            return res;
+        }
+
+        /// <summary>CTR (type 17): xor data with the keystream starting at counter IV + block (128-bit big-endian)</summary>
+        public virtual void XorCtr(byte[] data, int off, int len, byte[] iv, ulong block)
+        {
+            var ctr = (byte[])iv.Clone();
+            AddBE(ctr, block);
+            var ks = new byte[16];
+            for (int i = 0; i < len; i += 16)
+            {
+                Block(ctr, 0, ks, 0);
+                int n = Math.Min(16, len - i);
+                for (int j = 0; j < n; j++) data[off + i + j] ^= ks[j];
+                AddBE(ctr, 1);
+            }
+        }
+
+        protected static void AddBE(byte[] c, ulong v)
+        {
+            for (int i = 15; i >= 0 && v != 0; i--)
+            {
+                ulong s = c[i] + (v & 0xff);
+                c[i] = (byte)s;
+                v = (v >> 8) + (s >> 8);
+            }
+        }
+    }
+
+    /// <summary>Plain AES-256 with a key recovered from the white box (tools\gta6_keys.py); same results, much faster.</summary>
+    public class Rpf9Aes : Rpf9Cipher
+    {
+        public readonly byte[] Key;
+        public readonly bool Decryptor;
+        private readonly System.Threading.ThreadLocal<System.Security.Cryptography.ICryptoTransform> Tf;
+
+        public Rpf9Aes(byte[] key, bool decryptor)
+        {
+            Key = (byte[])key.Clone();
+            Decryptor = decryptor;
+            Tf = new System.Threading.ThreadLocal<System.Security.Cryptography.ICryptoTransform>(() =>
+            {
+                var a = System.Security.Cryptography.Aes.Create();
+                a.Mode = System.Security.Cryptography.CipherMode.ECB;
+                a.Padding = System.Security.Cryptography.PaddingMode.None;
+                a.Key = Key;
+                return Decryptor ? a.CreateDecryptor() : a.CreateEncryptor();
+            });
+        }
+
+        public override void Block(byte[] b, int bo, byte[] o, int oo) => Tf.Value.TransformBlock(b, bo, 16, o, oo);
+
+        public override byte[] DecryptCbc(byte[] data, int off, int len, byte[] iv)
+        {
+            var res = new byte[len];
+            int full = len & ~15;
+            if (full > 0)
+            {
+                Tf.Value.TransformBlock(data, off, full, res, 0);
+                for (int j = 0; j < 16; j++) res[j] ^= iv[j];
+                for (int i = 16; i < full; i++) res[i] ^= data[off + i - 16];
+            }
+            Buffer.BlockCopy(data, off + full, res, full, len - full);
+            return res;
+        }
+
+        public override void XorCtr(byte[] data, int off, int len, byte[] iv, ulong block)
+        {
+            int nb = (len + 15) / 16;
+            if (nb == 0) return;
+            var ctr = new byte[nb * 16];
+            var c = (byte[])iv.Clone();
+            AddBE(c, block);
+            for (int i = 0; i < nb; i++) { Buffer.BlockCopy(c, 0, ctr, 16 * i, 16); AddBE(c, 1); }
+            var ks = new byte[nb * 16];
+            Tf.Value.TransformBlock(ctr, 0, ctr.Length, ks, 0);
+            for (int i = 0; i < len; i++) data[off + i] ^= ks[i];
+        }
     }
 
     /// <summary>White-box AES-256 block function (13 table rounds + final per-byte tables from the key blob).</summary>
-    public class Rpf9WhiteBox
+    public class Rpf9WhiteBox : Rpf9Cipher
     {
         private readonly byte[][] IN = new byte[16][];
         private readonly uint[][] T = new uint[16][];
@@ -94,7 +255,7 @@ namespace CodeWalker.GameFiles
             Buffer.BlockCopy(blob, 4, K, 0, 240);
         }
 
-        public void Block(byte[] b, int bo, byte[] o, int oo)
+        public override void Block(byte[] b, int bo, byte[] o, int oo)
         {
             uint s0 = W(b, bo, 0), s1 = W(b, bo, 1), s2 = W(b, bo, 2), s3 = W(b, bo, 3);
             var T = this.T;
@@ -136,71 +297,121 @@ namespace CodeWalker.GameFiles
             return ((uint)IN[4 * w][b[i]] << 24 | (uint)IN[4 * w + 1][b[i + 1]] << 16 |
                     (uint)IN[4 * w + 2][b[i + 2]] << 8 | IN[4 * w + 3][b[i + 3]]) ^ K[w];
         }
-
-        /// <summary>CBC decryption (type 16); a trailing partial block is copied as-is</summary>
-        public byte[] DecryptCbc(byte[] data, int off, int len, byte[] iv)
-        {
-            var res = new byte[len];
-            var prev = (byte[])iv.Clone();
-            var blk = new byte[16];
-            int full = len & ~15;
-            for (int i = 0; i < full; i += 16)
-            {
-                Block(data, off + i, blk, 0);
-                for (int j = 0; j < 16; j++) res[i + j] = (byte)(blk[j] ^ prev[j]);
-                Buffer.BlockCopy(data, off + i, prev, 0, 16);
-            }
-            Buffer.BlockCopy(data, off + full, res, full, len - full);
-            return res;
-        }
-
-        /// <summary>CTR (type 17): xor data with the keystream starting at counter IV + block (128-bit big-endian)</summary>
-        public void XorCtr(byte[] data, int off, int len, byte[] iv, ulong block)
-        {
-            var ctr = (byte[])iv.Clone();
-            AddBE(ctr, block);
-            var ks = new byte[16];
-            for (int i = 0; i < len; i += 16)
-            {
-                Block(ctr, 0, ks, 0);
-                int n = Math.Min(16, len - i);
-                for (int j = 0; j < n; j++) data[off + i + j] ^= ks[j];
-                AddBE(ctr, 1);
-            }
-        }
-
-        private static void AddBE(byte[] c, ulong v)
-        {
-            for (int i = 15; i >= 0 && v != 0; i--)
-            {
-                ulong s = c[i] + (v & 0xff);
-                c[i] = (byte)s;
-                v = (v >> 8) + (s >> 8);
-            }
-        }
     }
 
     /// <summary>Keys, names and extension ids for GTA VI archives. Load once with the game exe before scanning.</summary>
     public static class Rpf9Keys
     {
-        // addresses in game_scarlett_master.exe (Xbox Series master build, SHA256 E95020B2...8993)
-        const ulong VA_IV = 0x1462FD470, VA_IN = 0x146036F30, VA_T = 0x146037F30;
-        const ulong VA_CIN = 0x146040F30, VA_CT = 0x146041F30, KEYTABLE = 0x1466E5900;
+        // Found in the exe by hash, like GTA5Keys does for GTA5.exe: FNV-1a of the first 16 bytes (quick filter) and SHA-1
+        // of the whole region. Values from game_scarlett_master.exe (Xbox Series master build, SHA256 E95020B2...8993),
+        // where the TOC IV is at 0x1462FD470, the type-16 tables (IN, T = IN + 0x1000) at 0x146036F30 and the type-17
+        // tables at 0x146040F30. The key blobs (magic) and the key table (record layout) are found by their structure.
+        const uint IV_FNV = 0x62EA022E, TOC_TABLES_FNV = 0x203F0A3D, CTR_TABLES_FNV = 0xFA0F86AD;
+        static readonly byte[] IV_SHA1 = Hex("5fed0c3bf7a4c1df050297e6e5a7467302c7374f");
+        static readonly byte[] TOC_TABLES_SHA1 = Hex("b1cf50a18eee7caf594bc7d7c4c7ef4f5921314e");
+        static readonly byte[] CTR_TABLES_SHA1 = Hex("98bd056264b3d73a97ed932c925079fc353131e9");
+        const int TABLES_SIZE = 0x5000; // 16 x 256-byte input tables, then 16 x 256 u32 round tables
         static readonly byte[] MAGIC = { 0x8E, 0x9B, 0x3B, 0x4E }, CTR_MAGIC = { 0x5D, 0xCE, 0x18, 0x27 };
-        static readonly Dictionary<uint, ulong> KnownKeys = new Dictionary<uint, ulong>
-        {
-            { 0x10000001, 0x1466EE360 }, { 0x10000002, 0x1466EF460 }, { 0x10000015, 0x1466E7D60 },
-            { 0x10000018, 0x1466EB060 }, { 0x10000019, 0x1466EC160 }, { 0x1000001A, 0x1466ED260 },
-        };
 
+        static byte[] Hex(string s)
+        {
+            var b = new byte[s.Length / 2];
+            for (int i = 0; i < b.Length; i++) b[i] = Convert.ToByte(s.Substring(2 * i, 2), 16);
+            return b;
+        }
+
+        public const string KeyFileName = "gta6_keys.dat";
         public static bool Loaded { get; private set; }
         public static string ExePath { get; private set; }
+        public static string KeyFilePath { get; private set; }
         public static string NamesPath { get; private set; }
         public static byte[] FixedIV;
-        public static Dictionary<uint, Rpf9WhiteBox> TocCiphers = new Dictionary<uint, Rpf9WhiteBox>(); // by key id
-        public static List<Rpf9WhiteBox> AllTocCiphers = new List<Rpf9WhiteBox>();
-        public static Dictionary<uint, Rpf9WhiteBox> DataCiphers = new Dictionary<uint, Rpf9WhiteBox>(); // type-17 key id
+        public static byte[] LsnsIV;
+        public static Dictionary<uint, Rpf9Cipher> TocCiphers = new Dictionary<uint, Rpf9Cipher>(); // by key id
+        public static List<Rpf9Cipher> AllTocCiphers = new List<Rpf9Cipher>();
+        public static Dictionary<uint, Rpf9Cipher> DataCiphers = new Dictionary<uint, Rpf9Cipher>(); // type-17 key id
+        public static Dictionary<uint, Rpf9Cipher> LsnsCiphers = new Dictionary<uint, Rpf9Cipher>(); // type-19 key id (decrypt)
+        public static Dictionary<int, uint[]> RelKeys = new Dictionary<int, uint[]>(); // audio .rel type id -> XXTEA key
         public static Dictionary<ulong, string> Names = new Dictionary<ulong, string>();
+
+        /// <summary>the key file next to the application, if there is one</summary>
+        public static string DefaultKeyFile()
+        {
+            var p = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, KeyFileName);
+            return File.Exists(p) ? p : null;
+        }
+
+        /// <summary>
+        /// Load the plain AES-256 keys written by tools\gta6_keys.py (format in that script's docstring): no game exe needed.
+        /// </summary>
+        public static void LoadKeyFile(string keyPath, string namesPath)
+        {
+            var d = File.ReadAllBytes(keyPath);
+            if (d.Length < 0x2C || d[0] != 'G' || d[1] != '6' || d[2] != 'K' || d[3] != 'Y') throw new InvalidDataException("not a GTA VI key file: " + keyPath);
+            int ver = BitConverter.ToInt32(d, 4);
+            if (ver != 1) throw new InvalidDataException("unsupported key file version " + ver);
+            int n = BitConverter.ToInt32(d, 0x28), p = 0x2C;
+            var toc = new Dictionary<uint, Rpf9Cipher>();
+            var data = new Dictionary<uint, Rpf9Cipher>();
+            var lsns = new Dictionary<uint, Rpf9Cipher>();
+            var all = new List<Rpf9Cipher>();
+            var seen = new Dictionary<string, Rpf9Cipher>();
+            var rel = new Dictionary<int, uint[]>();
+            byte[] tocIv = null, lsnsIv = null;
+            for (int i = 0; i < n; i++)
+            {
+                if (p + 8 > d.Length) throw new InvalidDataException("key file truncated");
+                int kind = BitConverter.ToUInt16(d, p), size = BitConverter.ToUInt16(d, p + 2);
+                uint id = BitConverter.ToUInt32(d, p + 4);
+                int q = p + 8;
+                p = q + size;
+                if (p > d.Length) throw new InvalidDataException("key file truncated");
+                if (kind == 1 && size >= 36)
+                {
+                    int cipher = d[q + 1];
+                    bool dec = d[q + 2] == 0;
+                    var key = new byte[32];
+                    Buffer.BlockCopy(d, q + 4, key, 0, 32);
+                    string sk = (dec ? "d" : "e") + BitConverter.ToString(key);
+                    if (!seen.TryGetValue(sk, out var c)) { c = new Rpf9Aes(key, dec); seen[sk] = c; if (cipher == 16 && dec) all.Add(c); }
+                    if (cipher == 16 && dec) toc[id] = c;
+                    else if (cipher == 17 && !dec) data[id] = c;
+                    else if (cipher == 19 && dec) lsns[id] = c;
+                }
+                else if (kind == 2 && size == 16)
+                {
+                    var iv = new byte[16];
+                    Buffer.BlockCopy(d, q, iv, 0, 16);
+                    if (id == 16) tocIv = iv; else if (id == 19) lsnsIv = iv;
+                }
+                else if (kind == 3 && size == 16)
+                {
+                    var k = new uint[4];
+                    for (int j = 0; j < 4; j++) k[j] = BitConverter.ToUInt32(d, q + 4 * j);
+                    rel[(int)id] = k;
+                }
+            }
+            if (tocIv == null || !toc.ContainsKey(0x10000001)) throw new InvalidDataException("key file has no RPF9 header key / IV");
+            FixedIV = tocIv; LsnsIV = lsnsIv;
+            TocCiphers = toc; DataCiphers = data; LsnsCiphers = lsns; AllTocCiphers = all; RelKeys = rel;
+            LoadNames(namesPath);
+            KeyFilePath = keyPath;
+            ExePath = null;
+            NamesPath = namesPath;
+            Loaded = true;
+        }
+
+        static void LoadNames(string namesPath)
+        {
+            if (string.IsNullOrEmpty(namesPath) || !File.Exists(namesPath)) return;
+            foreach (var line in File.ReadLines(namesPath))
+            {
+                int t = line.IndexOf('\t');
+                if (t <= 0 || t == line.Length - 1) continue;
+                if (ulong.TryParse(line.Substring(0, t), System.Globalization.NumberStyles.HexNumber, null, out ulong h))
+                    Names[h] = line.Substring(t + 1);
+            }
+        }
 
         /// <summary>
         /// Known extensions are cut off before a name is hashed and kept as an id in the row's record (resource record
@@ -221,52 +432,53 @@ namespace CodeWalker.GameFiles
             return d;
         }
 
+        /// <summary>
+        /// Lift the RPF9 TOC and file data ciphers from the game exe (white-box tables, used as they are). Throws when the
+        /// exe doesn't hold the known tables. The PSIN string (type 19) and audio .rel keys come only from a key file.
+        /// </summary>
         public static void Load(string exePath, string namesPath)
         {
             var pe = new Rpf9Pe(exePath);
-            FixedIV = pe.Read(VA_IV, 16);
+            ulong vaIv = pe.FindHashed(IV_FNV, IV_SHA1, 16);
+            ulong vaIn = pe.FindHashed(TOC_TABLES_FNV, TOC_TABLES_SHA1, TABLES_SIZE);
+            ulong vaCin = pe.FindHashed(CTR_TABLES_FNV, CTR_TABLES_SHA1, TABLES_SIZE);
+            var missing = new List<string>();
+            if (vaIv == 0) missing.Add("TOC IV");
+            if (vaIn == 0) missing.Add("TOC cipher tables");
+            if (vaCin == 0) missing.Add("file data cipher tables");
+            if (missing.Count > 0) throw new InvalidDataException("not a supported GTA VI exe, not found: " + string.Join(", ", missing));
+
             var blobs = pe.Blobs(MAGIC);
+            ulong keyTable = pe.FindKeyTable(blobs.Keys, out int rows);
+            if (keyTable == 0) throw new InvalidDataException("not a supported GTA VI exe: no key table");
+
+            var toc = new Dictionary<uint, Rpf9Cipher>();
+            var data = new Dictionary<uint, Rpf9Cipher>();
+            var all = new List<Rpf9Cipher>();
             var byVa = new Dictionary<ulong, Rpf9WhiteBox>();
             foreach (var kv in blobs)
             {
-                var c = new Rpf9WhiteBox(pe, kv.Value, VA_IN, VA_T, false);
+                var c = new Rpf9WhiteBox(pe, kv.Value, vaIn, vaIn + 0x1000, false);
                 byVa[kv.Key] = c;
-                AllTocCiphers.Add(c);
+                all.Add(c);
             }
-            foreach (var kv in KnownKeys)
+            for (int i = 0; i < rows; i++)
             {
-                if (byVa.TryGetValue(kv.Value, out var c)) TocCiphers[kv.Key] = c;
-            }
-            // key table: {u32 type << 24, u32 key id, u64 address, u64 length}
-            for (ulong o = KEYTABLE; ; o += 24)
-            {
-                var e = pe.Read(o, 24);
+                var e = pe.Read(keyTable + 24UL * (ulong)i, 24);
                 uint ty = BitConverter.ToUInt32(e, 0) >> 24, kid = BitConverter.ToUInt32(e, 4);
                 ulong ptr = BitConverter.ToUInt64(e, 8), len = BitConverter.ToUInt64(e, 16);
-                if (ptr < pe.ImageBase || ptr >= pe.ImageBase + 0x10000000 || len > 0x10000) break;
+                if (ty != 2) continue;
+                if (byVa.TryGetValue(ptr, out var tc)) { if (!toc.ContainsKey(kid)) toc[kid] = tc; continue; }
                 var blob = pe.Read(ptr, (int)len);
-                if (StartsWith(blob, CTR_MAGIC) && ty == 2)
-                {
-                    DataCiphers[kid] = new Rpf9WhiteBox(pe, blob, VA_CIN, VA_CT, true);
-                }
-                else if (StartsWith(blob, MAGIC) && !TocCiphers.ContainsKey(kid))
-                {
-                    foreach (var kv in blobs)
-                    {
-                        if (SameStart(kv.Value, blob, 16)) { TocCiphers[kid] = byVa[kv.Key]; break; }
-                    }
-                }
+                if (StartsWith(blob, CTR_MAGIC)) data[kid] = new Rpf9WhiteBox(pe, blob, vaCin, vaCin + 0x1000, true);
             }
-            if (!string.IsNullOrEmpty(namesPath) && File.Exists(namesPath))
-            {
-                foreach (var line in File.ReadLines(namesPath))
-                {
-                    int t = line.IndexOf('\t');
-                    if (t <= 0 || t == line.Length - 1) continue;
-                    if (ulong.TryParse(line.Substring(0, t), System.Globalization.NumberStyles.HexNumber, null, out ulong h))
-                        Names[h] = line.Substring(t + 1);
-                }
-            }
+            if (!toc.ContainsKey(0x10000001)) throw new InvalidDataException("not a supported GTA VI exe: no RPF9 header key");
+
+            FixedIV = pe.Read(vaIv, 16);
+            TocCiphers = toc; DataCiphers = data; AllTocCiphers = all;
+            LsnsCiphers = new Dictionary<uint, Rpf9Cipher>(); LsnsIV = null; RelKeys = new Dictionary<int, uint[]>();
+            LoadNames(namesPath);
+            KeyFilePath = null;
             ExePath = exePath;
             NamesPath = namesPath;
             Loaded = true;

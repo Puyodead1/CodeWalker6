@@ -204,6 +204,7 @@
             this.PlayListView.UseCompatibleStateImageBehavior = false;
             this.PlayListView.View = System.Windows.Forms.View.Details;
             this.PlayListView.SelectedIndexChanged += new System.EventHandler(this.PlayListView_SelectedIndexChanged);
+            this.PlayListView.ColumnClick += new System.Windows.Forms.ColumnClickEventHandler(this.PlayListView_ColumnClick);
             this.PlayListView.DoubleClick += new System.EventHandler(this.PlayListView_DoubleClick);
             // 
             // PlaylistNameHeader

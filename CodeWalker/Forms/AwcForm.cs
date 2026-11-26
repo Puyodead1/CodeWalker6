@@ -7,6 +7,8 @@ using System.Diagnostics;
 using System.Windows.Forms;
 using System.Drawing;
 using System.Linq;
+using System.Collections.Generic;
+using System.Threading.Tasks;
 using Range = FastColoredTextBoxNS.Range;
 
 namespace CodeWalker.Forms
@@ -123,8 +125,56 @@ namespace CodeWalker.Forms
             UpdateFormTitle();
         }
 
+        // GTA VI ('ADAT') bank: sounds decoded on play (Rpf9Awc + Concentus for Opus)
+        private byte[] Gta6Data;
+        private string Gta6Summary;
+
+        public void LoadGta6(string name, byte[] data, List<Rpf9Awc.Sound> sounds = null)
+        {
+            Awc = null;
+            Gta6Data = data;
+            Gta6Summary = null; //made when the XML tab is first shown
+            fileName = name;
+            PlayListView.BeginUpdate();
+            PlayListView.Items.Clear();
+            if (sounds == null) sounds = Rpf9Awc.Sounds(data);
+            DetailsPropertyGrid.SelectedObject = null;
+            double total = 0;
+            foreach (var s in sounds)
+            {
+                var item = PlayListView.Items.Add(s.Name);
+                var type = s.CodecText + " " + s.Rate + " Hz" + (s.Channels == 2 ? " stereo" : "");
+                if (!s.Playable) type += " (export only)";
+                item.SubItems.Add(type);
+                item.SubItems.Add(TimeSpan.FromSeconds(s.Seconds).ToString(s.Seconds >= 3600 ? "h\\:mm\\:ss\\.f" : "m\\:ss\\.f"));
+                item.SubItems.Add(TextUtil.GetBytesReadable(s.Bytes));
+                item.Tag = s;
+                total += s.Seconds;
+            }
+            PlayListView.EndUpdate();
+            InfoText = sounds.Count.ToString() + " track(s), Length: " + TimeSpan.FromSeconds(total).ToString("h\\:mm\\:ss");
+            LabelInfo.Text = InfoText;
+            UpdateFormTitle();
+        }
+
+        private string InfoText; //LabelInfo's normal text, restored after decode / export messages
+        private string ShownFeedError;
+
         public void LoadXml()
         {
+            if ((Awc == null) && (Gta6Data != null))
+            {
+                if (Gta6Summary == null)
+                {
+                    try { Gta6Summary = Rpf9Awc.Summary(Gta6Data, fileName); }
+                    catch (Exception ex) { Gta6Summary = ex.Message; }
+                }
+                LoadingXml = true;
+                XmlTextBox.Language = Language.Custom;
+                XmlTextBox.Text = Gta6Summary;
+                LoadingXml = false;
+                return;
+            }
             if (Awc != null)
             {
                 var xml = AwcXml.GetXml(Awc);
@@ -172,6 +222,31 @@ namespace CodeWalker.Forms
             if (PlayListView.SelectedItems.Count == 1)
             {
                 var item = PlayListView.SelectedItems[0];
+                if (item.Tag is Rpf9Awc.Sound s6)
+                {
+                    if (!s6.Playable)
+                    {
+                        LabelInfo.Text = s6.CodecText + " can't be played here: right-click the file > Export XML.";
+                    }
+                    else
+                    {
+                        try
+                        {
+                            //decoded on a background thread while it plays (a long Opus track takes seconds to decode)
+                            var data = Gta6Data;
+                            Player.LoadPcmStream(s6, s6.Rate > 0 ? s6.Rate : 48000, Math.Max(1, s6.Channels), (float)s6.Seconds, () => Rpf9Awc.DecodePcm(data, s6));
+                            Player.SetVolume(VolumeTrackBar.Value / 100.0f);
+                            Player.Play();
+                        }
+                        catch (Exception ex)
+                        {
+                            LabelInfo.Text = s6.Name + ": " + ex.Message;
+                        }
+                    }
+                    UpdateUI();
+                    UpdatePlayerButtons();
+                    return;
+                }
                 var audio = item.Tag as AwcStream;
                 var stereo = (audio?.ChannelStreams?.Length == 2);
                 if (stereo)
@@ -267,6 +342,21 @@ namespace CodeWalker.Forms
             else
             {
                 PositionTrackBar.Value = 0;
+            }
+
+            if (Gta6Data != null)
+            {
+                var err = Player.FeedError;
+                if ((err != null) && (err != ShownFeedError))
+                {
+                    ShownFeedError = err;
+                    LabelInfo.Text = "Decode error: " + err;
+                }
+                else if (err == null && !Exporting)
+                {
+                    var t = Player.FeedDecoding ? InfoText + "  (decoding...)" : InfoText;
+                    if (LabelInfo.Text != t) LabelInfo.Text = t;
+                }
             }
         }
 
@@ -374,6 +464,31 @@ namespace CodeWalker.Forms
             if (PlayListView.SelectedItems.Count == 1)
             {
                 var item = PlayListView.SelectedItems[0];
+                if (item.Tag is Rpf9Awc.Sound s6)
+                {
+                    if (!s6.Playable)
+                    {
+                        MessageBox.Show(s6.CodecText + " can't be decoded here: right-click the file > Export XML writes it raw.");
+                        return;
+                    }
+                    saveFileDialog.FileName = s6.Name + ".wav";
+                    if (saveFileDialog.ShowDialog() == DialogResult.OK)
+                    {
+                        //decode off the UI thread: a long track takes seconds
+                        var fn = saveFileDialog.FileName;
+                        var data = Gta6Data;
+                        Exporting = true;
+                        LabelInfo.Text = "Exporting " + s6.Name + "...";
+                        Task.Run(() => File.WriteAllBytes(fn, Rpf9Awc.DecodeWav(data, s6))).ContinueWith(t =>
+                        {
+                            Exporting = false;
+                            if (IsDisposed) return;
+                            if (t.Exception != null) MessageBox.Show("Error saving " + fn + ":\n" + t.Exception.InnerException?.Message);
+                            LabelInfo.Text = t.Exception == null ? "Saved " + fn : InfoText;
+                        }, TaskScheduler.FromCurrentSynchronizationContext());
+                    }
+                    return;
+                }
                 var audio = item.Tag as AwcStream;
                 var stereo = (audio?.ChannelStreams?.Length == 2);
 
@@ -420,6 +535,53 @@ namespace CodeWalker.Forms
                 {
                     ExportAsWav.Text = "Export as .midi";
                 }
+            }
+        }
+
+        private bool Exporting;
+
+        // column sorting: click a header to sort, click again to reverse
+        private int SortColumn = -1;
+        private bool SortDesc;
+
+        private void PlayListView_ColumnClick(object sender, ColumnClickEventArgs e)
+        {
+            if (e.Column == SortColumn) SortDesc = !SortDesc;
+            else { SortColumn = e.Column; SortDesc = false; }
+            var sel = PlayListView.SelectedItems.Count > 0 ? PlayListView.SelectedItems[0] : null;
+            PlayListView.BeginUpdate();
+            PlayListView.ListViewItemSorter = new ItemSorter(SortColumn, SortDesc);
+            PlayListView.Sort();
+            PlayListView.EndUpdate();
+            sel?.EnsureVisible();
+        }
+
+        private class ItemSorter : System.Collections.IComparer
+        {
+            private readonly int col; private readonly bool desc;
+            public ItemSorter(int col, bool desc) { this.col = col; this.desc = desc; }
+
+            // numbers for the length and size columns, from the row's sound (the cell text is formatted)
+            private static double Num(ListViewItem it, int col)
+            {
+                if (it.Tag is Rpf9Awc.Sound s) return col == 2 ? s.Seconds : s.Bytes;
+                if (it.Tag is AwcStream a) return col == 2 ? a.Length : a.ByteLength;
+                return 0;
+            }
+
+            public int Compare(object x, object y)
+            {
+                var a = (ListViewItem)x; var b = (ListViewItem)y;
+                int r;
+                if (col == 2 || col == 3) r = Num(a, col).CompareTo(Num(b, col));
+                else
+                {
+                    var sa = col < a.SubItems.Count ? a.SubItems[col].Text : "";
+                    var sb = col < b.SubItems.Count ? b.SubItems[col].Text : "";
+                    r = string.Compare(sa, sb, StringComparison.OrdinalIgnoreCase);
+                }
+                if (r == 0) r = string.Compare(a.Text, b.Text, StringComparison.OrdinalIgnoreCase);
+                return desc ? -r : r;
             }
         }
 

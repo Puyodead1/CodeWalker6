@@ -20,8 +20,9 @@ namespace CodeWalker.GameFiles
 
         public readonly string Path;
         FileStream fs;
-        readonly long[] off;      // chunk file offsets, + file size
-        readonly int[] codec;
+        readonly long[] off;      // chunk file offsets, + end sentinel
+        readonly int[] codec;     // 0 stored, 1-7 BCPack BC1..BC7, 8 zlib
+        readonly int[] pad;       // bytes at the chunk end that are not data
         readonly long[] page;     // first 4 KB virtual page of each chunk, + end
         readonly ulong[] q0, q1, hashes;
         public readonly Dictionary<ulong, int> Index = new Dictionary<ulong, int>();
@@ -32,35 +33,33 @@ namespace CodeWalker.GameFiles
         {
             Path = path;
             fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-            var head = ReadAt(0, 0x18);
+            // +0x04 u32 n, +0x08 u64 (bits 0-39 virtual size), +0x10 n x u64 chunk entries (exe 0x140F435F0):
+            // bits 0-25 offset >> 8, 26-29 codec, 30-51 first 4 KB page, 52-63 pad; the last entry is the end sentinel
+            var head = ReadAt(0, 0x10);
             if (head[0] != 'R' || head[1] != 'D' || head[2] != 'S' || head[3] != '5') throw new InvalidDataException("not RDS5");
             int n = BitConverter.ToInt32(head, 4);
-            uint vsize = BitConverter.ToUInt32(head, 8);
-            var tab = ReadAt(0x18, 8 * n);
+            if (n < 2) throw new InvalidDataException("empty chunk table");
+            var tab = ReadAt(0x10, 8 * n);
             int nc = n - 1;
-            off = new long[nc + 1]; codec = new int[nc]; page = new long[nc + 1];
-            for (int i = 0; i < nc; i++)
+            off = new long[n]; page = new long[n]; codec = new int[nc]; pad = new int[nc];
+            for (int i = 0; i < n; i++)
             {
-                uint a = BitConverter.ToUInt32(tab, 8 * i), b = BitConverter.ToUInt32(tab, 8 * i + 4);
-                off[i] = (long)(a & 0xffffff) << 8;
-                codec[i] = (int)((a >> 24) & 0x3f);
-                page[i] = ((long)(b & 0xfffff) << 2) | (a >> 30);
+                ulong x = BitConverter.ToUInt64(tab, 8 * i);
+                off[i] = (long)(x & 0x3ffffff) << 8;
+                page[i] = (long)((x >> 30) & 0x3fffff);
+                if (i < nc) { codec[i] = (int)((x >> 26) & 15); pad[i] = (int)(x >> 52); }
             }
-            off[nc] = fs.Length;
-            page[nc] = vsize >> 12;
-            var hdr = ReadAt(0, (int)Math.Min(off[0], fs.Length));
-            int e = -1;
-            for (int i = 0x18 + 8 * (n - 1); i + 16 <= hdr.Length; i++)   // some packs have no terminator entry: ETPF starts in its slot
-                if (hdr[i] == 'E' && hdr[i + 1] == 'T' && hdr[i + 2] == 'P' && hdr[i + 3] == 'F') { e = i; break; }
-            if (e < 0) throw new InvalidDataException("no ETPF table");
-            int cnt = BitConverter.ToInt32(hdr, e + 8);
-            if (e + 16 + 24L * cnt > hdr.Length) throw new InvalidDataException("ETPF table truncated");
+            // the ETPF index is at virtual offset 0 (chunk 0, stored)
+            var eh = Read(0, 16);
+            if (eh[0] != 'E' || eh[1] != 'T' || eh[2] != 'P' || eh[3] != 'F') throw new InvalidDataException("no ETPF table");
+            int cnt = BitConverter.ToInt32(eh, 8);
+            var hdr = Read(0, 16 + 24L * cnt);
             q0 = new ulong[cnt]; q1 = new ulong[cnt]; hashes = new ulong[cnt];
             for (int i = 0; i < cnt; i++)
             {
-                q0[i] = BitConverter.ToUInt64(hdr, e + 16 + 16 * i);
-                q1[i] = BitConverter.ToUInt64(hdr, e + 24 + 16 * i);
-                hashes[i] = BitConverter.ToUInt64(hdr, e + 16 + 16 * cnt + 8 * i);
+                q0[i] = BitConverter.ToUInt64(hdr, 16 + 16 * i);
+                q1[i] = BitConverter.ToUInt64(hdr, 24 + 16 * i);
+                hashes[i] = BitConverter.ToUInt64(hdr, 16 + 16 * cnt + 8 * i);
                 Index[hashes[i]] = i;
             }
         }
@@ -120,9 +119,10 @@ namespace CodeWalker.GameFiles
             if (cache.TryGetValue(i, out var d)) { lru.Remove(i); lru.AddFirst(i); return d; }
             int c = codec[i];
             int nbytes = (int)((page[i + 1] - page[i]) << 12);
-            if ((c & 0x20) != 0)
+            int csize = (int)(off[i + 1] - off[i] - pad[i]);   // compressed size (exe 0x1455B23E0)
+            if (c == 8)
             {
-                var src = ReadAt(off[i] + 2, (int)(off[i + 1] - off[i] - 2));   // skip the zlib header
+                var src = ReadAt(off[i] + 2, csize - 2);   // skip the zlib header
                 using (var ms = new MemoryStream(src))
                 using (var ds = new DeflateStream(ms, CompressionMode.Decompress))
                 using (var o = new MemoryStream(nbytes))
@@ -131,19 +131,21 @@ namespace CodeWalker.GameFiles
                     d = o.ToArray();
                 }
             }
-            else if ((c & 0x1f) != 0)
+            else if (c >= 1 && c <= 7)   // BCPack BC1..BC7
             {
                 var fn = BcPack ?? throw new BcPackMissingException();
-                var src = ReadAt(off[i], (int)(off[i + 1] - off[i]) + 4096);   // slack: the decoder may read ahead
+                var src = new byte[csize + 4096];   // slack: the decoder may read ahead
+                Buffer.BlockCopy(ReadAt(off[i], csize), 0, src, 0, csize);
                 d = new byte[nbytes];
                 var hs = GCHandle.Alloc(src, GCHandleType.Pinned);
                 var hd = GCHandle.Alloc(d, GCHandleType.Pinned);
                 int hr;
-                try { hr = fn((ulong)(c >> 2), hd.AddrOfPinnedObject(), (ulong)nbytes, hs.AddrOfPinnedObject()); }
+                try { hr = fn((ulong)c, hd.AddrOfPinnedObject(), (ulong)nbytes, hs.AddrOfPinnedObject()); }
                 finally { hs.Free(); hd.Free(); }
                 if (hr != 0) throw new InvalidDataException("BCPack error " + hr.ToString("x8"));
             }
-            else d = ReadAt(off[i], nbytes);
+            else if (c == 0) d = ReadAt(off[i], csize);
+            else throw new NotSupportedException("chunk codec " + c);
             cache[i] = d;
             lru.AddFirst(i);
             while (lru.Count > 8) { cache.Remove(lru.Last.Value); lru.RemoveLast(); }
@@ -173,7 +175,9 @@ namespace CodeWalker.GameFiles
 
         // ------------------------------------------------------------------ textures
 
-        public class Record { public int W, H, Fmt, Mips; public bool Big; public long Page; }
+        /// <summary>Texture record (exe decoder 0x1451FB680). Cube: 6 faces (not decoded); Flags: q0 bits 42-43,
+        /// data with zero pages filled from elsewhere (not decoded).</summary>
+        public class Record { public int W, H, Fmt, Mips, Flags; public bool Big, Cube; public long Page; }
 
         public Record GetRecord(int i)
         {
@@ -182,7 +186,13 @@ namespace CodeWalker.GameFiles
             int mips = (int)((a >> 28) & 15) + (int)((a >> 32) & 7);
             int full = 0;
             for (int m = Math.Max(w, h); m > 0; m >>= 1) full++;
-            return new Record { W = w, H = h, Fmt = (int)((a >> 35) & 0x1ff), Mips = Math.Max(1, Math.Min(mips, full)), Big = (a >> 56) == 0, Page = (long)(q1[i] & 0xfffff) };
+            return new Record
+            {
+                W = w, H = h, Fmt = (int)((a >> 35) & 0x7f), Mips = Math.Max(1, Math.Min(mips, full)),
+                Big = ((a >> 56) & 7) == 0,          // tiling 0 = 64 KB tiles, 1-4 = 4 KB tiles
+                Cube = ((a >> 59) & 1) != 0, Flags = (int)((a >> 42) & 3),
+                Page = (long)(q1[i] & 0x1fffff),
+            };
         }
 
         static int Count(string p, char c) { int n = 0; foreach (var x in p) if (x == c) n++; return n; }
@@ -198,7 +208,7 @@ namespace CodeWalker.GameFiles
                 // mips are stored smallest first: without BCPack.dll, show the largest reduced texture that is zlib/stored
                 for (int m0 = 1; m0 < t.Mips; m0++)
                 {
-                    var t2 = new Record { W = Math.Max(1, t.W >> m0), H = Math.Max(1, t.H >> m0), Fmt = t.Fmt, Mips = t.Mips - m0, Big = t.Big, Page = t.Page };
+                    var t2 = new Record { W = Math.Max(1, t.W >> m0), H = Math.Max(1, t.H >> m0), Fmt = t.Fmt, Mips = t.Mips - m0, Big = t.Big, Cube = t.Cube, Flags = t.Flags, Page = t.Page };
                     try { return Decode(key, t2); } catch (BcPackMissingException) { }
                 }
                 throw;
@@ -242,7 +252,7 @@ namespace CodeWalker.GameFiles
             var t = GetRecord(i);
             int m0 = 0;
             while (m0 < t.Mips - 1 && Math.Max(t.W >> m0, t.H >> m0) > maxDim) m0++;
-            var t2 = new Record { W = Math.Max(1, t.W >> m0), H = Math.Max(1, t.H >> m0), Fmt = t.Fmt, Mips = t.Mips - m0, Big = t.Big, Page = t.Page };
+            var t2 = new Record { W = Math.Max(1, t.W >> m0), H = Math.Max(1, t.H >> m0), Fmt = t.Fmt, Mips = t.Mips - m0, Big = t.Big, Cube = t.Cube, Flags = t.Flags, Page = t.Page };
             return Decode(key, t2);
         }
 
@@ -250,6 +260,8 @@ namespace CodeWalker.GameFiles
 
         Texture Decode(ulong key, Record t)
         {
+            if (t.Cube) throw new NotSupportedException("cube map");
+            if (t.Flags != 0) throw new NotSupportedException("format flags " + t.Flags);
             if (!Rpf9Texture.FMT.TryGetValue(t.Fmt, out var fb) || Rpf9Texture.LegacyFormat(t.Fmt) == 0) throw new NotSupportedException("DXGI format " + t.Fmt);
             int bpe = fb[0], blk = fb[1];
             string p = t.Big ? (PAT64.TryGetValue(bpe, out var p64) ? p64 : null) : Rpf9Texture.PAT[bpe];

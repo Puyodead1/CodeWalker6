@@ -26,6 +26,9 @@ namespace CodeWalker.GameFiles
         public int CipherType { get; set; }
         public byte[] IV { get; set; }
         public long[] EncParams { get; set; }
+        /// <summary>info chunk table (column e0c12d7a5d4884c5): per chunk {exact stored size, padding, output size,
+        /// method (3 = zlib, else stored)}; null when the row has none (stored, or the content heuristic)</summary>
+        public long[][] Chunks { get; set; }
 
         public override long GetFileSize() => UncompressedSize;
         public override string ToString() => (IsResource ? "RPF9 resource: " : "RPF9 file: ") + Path;
@@ -82,22 +85,54 @@ namespace CodeWalker.GameFiles
             }
         }
 
-        public byte[] Get(ulong h, int r)
+        /// <summary>position of row r's record in column h within T, or -1 (es = record size)</summary>
+        public int Pos(ulong h, int r, out int es)
         {
-            if (!ByHash.TryGetValue(h, out int ci)) return null;
+            es = 0;
+            if (!ByHash.TryGetValue(h, out int ci)) return -1;
             uint k = ci < Nm ? Index(D + W * (r * Nm + ci)) : Index(L + W * (r * Hi + ci - Nm));
-            if (k == None) return null;
-            int es = ColEs[ci], off = ColOff[ci], at;
+            if (k == None) return -1;
+            int off = ColOff[ci], at;
+            es = ColEs[ci];
             if ((es >> 16) != 0)
             {
                 es &= 0xffff;
                 at = L + LE + off + (int)k * es;
             }
             else at = E + off + (int)k * es;
-            if (at < 0 || at + es > T.Length) return null;
+            if (at < 0 || at + es > T.Length) return -1;
+            return at;
+        }
+
+        public byte[] Get(ulong h, int r)
+        {
+            int at = Pos(h, r, out int es);
+            if (at < 0) return null;
             var b = new byte[es];
             Buffer.BlockCopy(T, at, b, 0, es);
             return b;
+        }
+
+        /// <summary>row r's chunk table from its info record {u32 table offset from the record, u16 count, u8 8,
+        /// u8 entry format} (decoder sub_14550DB40); null when absent or of an unknown format</summary>
+        public long[][] Chunks(int r)
+        {
+            int p = Pos(H_INFO, r, out int es);
+            if (p < 0 || es < 8) return null;
+            long off = BitConverter.ToUInt32(T, p);
+            int n = BitConverter.ToUInt16(T, p + 4), fmt = T[p + 7];
+            if (fmt < 2 || fmt > 4 || n == 0 || p + off + 8L * n > T.Length) return null;
+            var res = new long[n][];
+            for (int i = 0; i < n; i++)
+            {
+                ulong e = BitConverter.ToUInt64(T, (int)(p + off + 8 * i));
+                long pad, al, outn, m;
+                if (fmt == 2) { pad = (long)((e >> 58) & 0xF); al = (long)((e >> 28) & 0xFFFFFF0); outn = (long)((e << 4) & 0xFFFFFF0); m = (long)(e >> 62); }
+                else if (fmt == 3) { long w1 = (long)((e >> 16) & 0xFFFF); pad = w1 & 0xF; al = 0x10000 - w1 + pad; outn = 0x10000 - (long)(e & 0xFFFF); m = (long)((e >> 60) & 3); }
+                else { pad = (long)((e >> 52) & 0xF); al = (long)((e >> 24) & 0xFFFFFF0); outn = (long)(e & 0xFFFFFFF); m = (long)((e >> 56) & 3); }
+                res[i] = new[] { al - pad, pad, outn, m };
+            }
+            return res;
         }
 
         /// <summary>raw = the archive's first `end` bytes (u32 at +4); returns them with the header blocks and TOC
@@ -106,7 +141,8 @@ namespace CodeWalker.GameFiles
         {
             if (raw.Length < 0x40 || BitConverter.ToUInt32(raw, 0) != 0x52504639) throw new InvalidDataException("not RPF9");
             int end = BitConverter.ToInt32(raw, 4), lk = BitConverter.ToInt32(raw, 8);
-            if ((raw[0x2E] & 1) == 0) throw new InvalidDataException("RPF9 header +0x2E = " + raw[0x2E] + ": single-region layout not handled");
+            if (raw[0x2E] == 0) return (byte[])raw.Clone();      // no header descriptor: the TOC is not encrypted (sub_140A349A0)
+            if ((raw[0x2E] & 1) == 0) throw new InvalidDataException("RPF9 header +0x2E = " + raw[0x2E] + ": single-region layout (exe only, no archive uses it) not handled");
             int na = BitConverter.ToUInt16(raw, 0x1A);
             int bsz = BitConverter.ToInt32(raw, 0x1C), tail = BitConverter.ToInt32(raw, 0x30);
             int arr = (8 * na + 15) & ~15;
@@ -147,17 +183,50 @@ namespace CodeWalker.GameFiles
         }
     }
 
+    /// <summary>Read-only window [off, off+len) of another stream (a plain nested archive inside its parent).
+    /// Owns the base stream.</summary>
+    internal class Rpf9SubStream : Stream
+    {
+        private readonly Stream B;
+        private readonly long Off, Len;
+        private long Pos;
+        public Rpf9SubStream(Stream b, long off, long len) { B = b; Off = off; Len = len; }
+        public override bool CanRead => true;
+        public override bool CanSeek => true;
+        public override bool CanWrite => false;
+        public override long Length => Len;
+        public override long Position { get => Pos; set => Pos = value; }
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            if (Pos >= Len || count <= 0) return 0;
+            count = (int)Math.Min(count, Len - Pos);
+            B.Position = Off + Pos;
+            int n = B.Read(buffer, offset, count);
+            if (n > 0) Pos += n;
+            return n;
+        }
+        public override long Seek(long offset, SeekOrigin origin)
+        {
+            Pos = origin == SeekOrigin.Begin ? offset : origin == SeekOrigin.Current ? Pos + offset : Len + offset;
+            return Pos;
+        }
+        public override void Flush() { }
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        protected override void Dispose(bool disposing) { if (disposing) B.Dispose(); base.Dispose(disposing); }
+    }
+
     /// <summary>A file's stored bytes with its encrypted parts decrypted (port of rpf9x.View).</summary>
     internal class Rpf9View
     {
         private readonly Stream S;
         private readonly long Off, Base;
         public readonly long Cs;
-        private readonly Rpf9WhiteBox Ctr;
+        private readonly Rpf9Cipher Ctr;
         private readonly byte[] Iv;
         private readonly List<long[]> Segs = new List<long[]>();
 
-        public Rpf9View(Stream s, long off, long cs, Rpf9WhiteBox ctr = null, byte[] iv = null, long[] p = null, long bas = 0)
+        public Rpf9View(Stream s, long off, long cs, Rpf9Cipher ctr = null, byte[] iv = null, long[] p = null, long bas = 0)
         {
             S = s; Off = off; Cs = cs; Ctr = ctr; Iv = iv; Base = bas;
             if (ctr == null) return;
@@ -269,9 +338,42 @@ namespace CodeWalker.GameFiles
             return n;
         }
 
+        /// <summary>decompress by the info chunk table (port of rpf9x.inflate_chunks): each chunk is a zlib stream
+        /// (method 3) or stored, 16-byte aligned. Returns the output length, or -1 when a chunk doesn't give its size.</summary>
+        static long InflateChunks(Rpf9View view, long[][] chunks, Rpf9Out o, long p)
+        {
+            long n = 0;
+            foreach (var c in chunks)
+            {
+                if (o.Full) return o.Total;
+                long exact = c[0], pad = c[1], outn = c[2], m = c[3], t0 = o.Total;
+                if (m == 3)
+                {
+                    var inf = new Rpf9Inflater(view, p, o);
+                    try { inf.Run(true); }
+                    catch (Exception ex) when (ex is InvalidDataException || ex is EndOfStreamException) { return -1; }
+                }
+                else
+                {
+                    for (long q = 0; q < outn && !o.Full; q += WIN)
+                    {
+                        var b = view.Read(p + q, Math.Min(WIN, outn - q), 15);
+                        if (b.Length == 0) break;
+                        o.Write(b, 0, b.Length);
+                    }
+                }
+                long got = o.Total - t0;
+                if (o.Full) return o.Total;
+                if (got != outn) return -1;
+                n += outn;
+                p += exact + pad;
+            }
+            return n;
+        }
+
         static Rpf9View View(Stream s, Rpf9FileEntry e)
         {
-            Rpf9WhiteBox ctr = null;
+            Rpf9Cipher ctr = null;
             if (e.IV != null)
             {
                 if (e.CipherType != 17 || !Rpf9Keys.DataCiphers.TryGetValue(e.KeyId, out ctr))
@@ -290,6 +392,14 @@ namespace CodeWalker.GameFiles
             bool Ok(long n) => want >= us ? n == us : n >= want;
             string comp = "";
             long got = 0;
+            if (e.Chunks != null)
+            {
+                // the info record's chunk table gives each chunk's stored size and method (exact, from the exe)
+                got = InflateChunks(view, e.Chunks, o, e.DataStart);
+                if (Ok(got)) return;
+                o.Reset();
+                got = 0;
+            }
             if (ZHeader(view.Read(e.DataStart, 2)))
             {
                 comp = "zlib";
@@ -333,7 +443,7 @@ namespace CodeWalker.GameFiles
                 {
                     Directory.CreateDirectory(dir);
                     string part = fn + ".part";
-                    using (var src = File.OpenRead(GetDataPath(f.Parent)))
+                    using (var src = OpenData(f.Parent))
                     using (var dst = new FileStream(part, FileMode.Create, FileAccess.ReadWrite))
                     {
                         var o = new Rpf9Out(0, dst);
@@ -348,10 +458,37 @@ namespace CodeWalker.GameFiles
             }
         }
 
+        /// <summary>A stream of an archive's own (decompressed) bytes. A nested archive stored plain (no
+        /// compression, no encryption, e.g. the audio.rpf packs) is read in place from its parent; any other is
+        /// decompressed to the cache folder first (GetDataPath).</summary>
+        public static Stream OpenData(RpfFile f)
+        {
+            if (f.Parent == null) return File.OpenRead(f.FilePath);
+            if ((f.Rpf9DataPath == null) && (f.ParentFileEntry is Rpf9FileEntry pe) && (pe.IV == null)
+                && (pe.CompressedSize >= pe.UncompressedSize) && (pe.CompressedSize - pe.UncompressedSize < 16))
+            {
+                var ps = OpenData(f.Parent);
+                try
+                {
+                    long at = pe.DataOffset + pe.DataStart;
+                    if (at + pe.UncompressedSize <= ps.Length)
+                    {
+                        var h = new byte[4];
+                        ps.Position = at;
+                        if (ps.Read(h, 0, 4) == 4 && IsRpf9(BitConverter.ToUInt32(h, 0)))
+                            return new Rpf9SubStream(ps, at, pe.UncompressedSize);
+                    }
+                }
+                catch { ps.Dispose(); throw; }
+                ps.Dispose();
+            }
+            return File.OpenRead(GetDataPath(f));
+        }
+
         /// <summary>the decompressed (and decrypted) contents of a file</summary>
         public static byte[] ExtractFile(Rpf9FileEntry e)
         {
-            using (var s = File.OpenRead(GetDataPath(e.File)))
+            using (var s = OpenData(e.File))
             {
                 var o = new Rpf9Out(e.UncompressedSize);
                 Extract(s, e, o, long.MaxValue);
@@ -362,7 +499,7 @@ namespace CodeWalker.GameFiles
         /// <summary>the stored (compressed) bytes of a file, decrypted</summary>
         public static byte[] ExtractRaw(Rpf9FileEntry e)
         {
-            using (var s = File.OpenRead(GetDataPath(e.File)))
+            using (var s = OpenData(e.File))
             {
                 return View(s, e).Read(0, e.CompressedSize);
             }
@@ -490,7 +627,7 @@ namespace CodeWalker.GameFiles
                     uint vs = BitConverter.ToUInt32(rr, 0), ps = BitConverter.ToUInt32(rr, 4);
                     e.CompressedSize = (long)BitConverter.ToUInt32(rr, 8) * 16;
                     e.DataOffset = (long)BitConverter.ToUInt32(rr, 12) * 16;
-                    e.ResourceVersion = BitConverter.ToUInt32(rr, 16);
+                    e.ResourceVersion = ((vs & 15) << 4) | (ps & 15);   // RSC8 version (sub_1428CED60)
                     e.DataStart = 16;
                     e.VirtualSize = vs & ~15u;
                     e.UncompressedSize = e.VirtualSize + (ps & ~15u);
@@ -498,6 +635,7 @@ namespace CodeWalker.GameFiles
                 }
                 else continue;
                 e.ExtensionId = rr != null ? rr[16] : fr[5];
+                e.Chunks = toc.Chunks(r);
                 var er = toc.Get(Rpf9Toc.H_ENC, r);
                 if (er != null)
                 {
@@ -556,7 +694,7 @@ namespace CodeWalker.GameFiles
             }
 
             if (nested.Count == 0) return;
-            using (var s = File.OpenRead(GetDataPath(rpf)))
+            using (var s = OpenData(rpf))
             {
                 foreach (var e in nested)
                 {
