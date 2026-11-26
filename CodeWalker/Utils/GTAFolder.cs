@@ -46,10 +46,33 @@ namespace CodeWalker
         public static bool UseGta6Folder(string folder)
         {
             if (!IsGta6Folder(folder)) return false;
-            CurrentGTAFolder = folder.TrimEnd('\\');
+            CurrentGTAFolder = NormalizeFolder(folder);
             IsGen9 = false;
             IsGta6 = true;
             return true;
+        }
+
+        /// <summary>
+        /// use a GTA V folder for this session only (doesn't change the saved folder). gen9 null = Enhanced only when the
+        /// folder has gta5_enhanced.exe and no gta5.exe.
+        /// </summary>
+        public static bool UseGta5Folder(string folder, bool? gen9)
+        {
+            if (string.IsNullOrWhiteSpace(folder) || IsGta6Folder(folder)) return false;
+            bool legacy = File.Exists(Path.Combine(folder, "gta5.exe")), enhanced = IsGen9Folder(folder);
+            bool g9 = gen9 ?? (enhanced && !legacy);
+            if (!ValidateGTAFolder(folder, g9)) return false;
+            CurrentGTAFolder = NormalizeFolder(folder);
+            IsGen9 = g9;
+            IsGta6 = false;
+            return true;
+        }
+
+        /// <summary>full path without a trailing backslash, except a drive root (G:\), which keeps it</summary>
+        static string NormalizeFolder(string folder)
+        {
+            var full = Path.GetFullPath(folder.Trim('"').Trim());
+            return full.Length > 3 ? full.TrimEnd('\\') : full;
         }
 
         /// <summary>GTA VI: the game exe (keys and cipher tables are read from it) and the hash names list</summary>

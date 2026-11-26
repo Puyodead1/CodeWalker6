@@ -205,7 +205,15 @@ namespace CodeWalker
                     return;
                 }
 
-                RefreshMainTreeView();
+                try
+                {
+                    RefreshMainTreeView();
+                }
+                catch (Exception ex)
+                {
+                    UpdateStatus("Scan failed: " + ex.Message);
+                    return;
+                }
 
                 UpdateStatus("Scan complete.");
 
@@ -266,7 +274,15 @@ namespace CodeWalker
                 }
                 UpdateStatus(string.Format("{0} names, {1} TOC keys, {2} data keys ({3}). Scanning...", Rpf9Keys.Names.Count, Rpf9Keys.TocCiphers.Count, Rpf9Keys.DataCiphers.Count, keyFile ? "key file" : "lifted from the exe"));
 
-                RefreshMainTreeView();
+                try
+                {
+                    RefreshMainTreeView();
+                }
+                catch (Exception ex)
+                {
+                    UpdateStatus("Scan failed: " + ex.Message);
+                    return;
+                }
 
                 UpdateStatus("Scan complete.");
             });
@@ -887,12 +903,49 @@ namespace CodeWalker
 
             MainTreeViewRefreshComplete();
         }
+        /// <summary>
+        /// every file and folder below a folder, like GetFileSystemEntries(AllDirectories), but folders that can't be read
+        /// and hidden system folders are skipped (a drive root holds System Volume Information and $RECYCLE.BIN, which made
+        /// the whole scan throw)
+        /// </summary>
+        private static List<string> GetFileSystemEntriesSafe(string folder)
+        {
+            var res = new List<string>();
+            var stack = new Stack<string>();
+            stack.Push(folder);
+            while (stack.Count > 0)
+            {
+                var dir = stack.Pop();
+                string[] files, dirs;
+                try
+                {
+                    files = Directory.GetFiles(dir);
+                    dirs = Directory.GetDirectories(dir);
+                }
+                catch (UnauthorizedAccessException) { continue; }
+                catch (IOException) { continue; }
+                foreach (var d in dirs)
+                {
+                    try
+                    {
+                        var at = File.GetAttributes(d);
+                        if ((at & (FileAttributes.Hidden | FileAttributes.System)) == (FileAttributes.Hidden | FileAttributes.System)) continue;
+                    }
+                    catch { continue; }
+                    res.Add(d);
+                    stack.Push(d);
+                }
+                res.AddRange(files);
+            }
+            return res;
+        }
+
         private void RefreshMainTreeViewRoot(MainTreeFolder f, bool extra = false)
         {
             var allRpfs = new List<RpfFile>();
             var fullPath = f.FullPath;
             var subPath = f.Path;
-            var allpaths = Directory.GetFileSystemEntries(fullPath, "*", SearchOption.AllDirectories);
+            var allpaths = GetFileSystemEntriesSafe(fullPath);
             var nodes = new Dictionary<string, MainTreeFolder>();
 
             foreach (var path in allpaths)

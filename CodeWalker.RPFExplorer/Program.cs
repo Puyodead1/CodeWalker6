@@ -19,14 +19,19 @@ namespace CodeWalker.RPFExplorer
         {
             //Process.Start("CodeWalker.exe", "explorer");
 
-            // GTA VI: CodeWalker.RPFExplorer.exe <folder with RPF9 archives> [--exe=<game_scarlett_master.exe>] [--names=<rpf9_names.tsv>]
+            // Open a game folder for this session only (the saved folder is unchanged):
+            //   GTA VI: "CodeWalker RPF Explorer.exe" <folder with RPF9 archives> [--exe=<game_scarlett_master.exe>] [--names=<rpf9_names.tsv>]
+            //   GTA V:  "CodeWalker RPF Explorer.exe" <folder with GTA5.exe / gta5_enhanced.exe> [--legacy | --enhanced]
+            bool? gen9 = null;
+            if (args.Contains("--legacy")) gen9 = false;
+            if (args.Contains("--enhanced")) gen9 = true;
             foreach (var a in args)
             {
                 if (a.StartsWith("--exe=")) GTAFolder.Gta6Exe = a.Substring(6).Trim('"');
                 else if (a.StartsWith("--names=")) GTAFolder.Gta6Names = a.Substring(8).Trim('"');
-                else if (!a.StartsWith("--") && !GTAFolder.UseGta6Folder(a.Trim('"')))
+                else if (!a.StartsWith("--") && !GTAFolder.UseGta6Folder(a.Trim('"')) && !GTAFolder.UseGta5Folder(a.Trim('"'), gen9))
                 {
-                    MessageBox.Show("Not a GTA VI folder (no RPF9 archives in it): " + a, "CodeWalker RPF Explorer");
+                    MessageBox.Show("Not a game folder (no RPF9 archives, " + (gen9 == true ? "no gta5_enhanced.exe" : "no GTA5.exe") + "): " + a, "CodeWalker RPF Explorer");
                 }
             }
 
