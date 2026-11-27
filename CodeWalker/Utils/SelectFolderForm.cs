@@ -85,8 +85,8 @@ namespace CodeWalker.Utils
         {
             using (var ofd = new OpenFileDialog())
             {
-                ofd.Title = "GTA VI keys: the game exe (game_scarlett_master.exe) or a key file (gta6_keys.dat)";
-                ofd.Filter = "Game exe or key file (*.exe;*.dat)|*.exe;*.dat|All files (*.*)|*.*";
+                ofd.Title = "GTA VI keys: the game exe (game_scarlett_master.exe, PS5: decrypted eboot.bin) or a key file (gta6_keys.dat)";
+                ofd.Filter = "Game exe or key file (*.exe;*.bin;*.dat)|*.exe;*.bin;*.dat|All files (*.*)|*.*";
                 if (File.Exists(KeysTextBox.Text)) ofd.FileName = KeysTextBox.Text;
                 if (ofd.ShowDialog(this) == DialogResult.OK) KeysTextBox.Text = ofd.FileName;
             }

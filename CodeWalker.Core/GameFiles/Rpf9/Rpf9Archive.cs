@@ -149,6 +149,15 @@ namespace CodeWalker.GameFiles
             int s = 0x40 + arr + bsz;
             if (!Rpf9Keys.TocCiphers.TryGetValue(0x10000001, out var hc)) throw new Exception("RPF9 header key not loaded");
             var ab = hc.DecryptCbc(raw, 0x40, s - tail - 0x40, Rpf9Keys.FixedIV);
+            // another build's archive (PS5): its own header key and IV give the key descriptor
+            if (!(arr + 22 <= ab.Length && (BitConverter.ToUInt32(ab, arr) >> 8) == 0x100000))
+            {
+                foreach (var alt in Rpf9Keys.AltHeaders)
+                {
+                    var t = alt.Key.DecryptCbc(raw, 0x40, s - tail - 0x40, alt.Value);
+                    if (arr + 22 <= t.Length && (BitConverter.ToUInt32(t, arr) >> 8) == 0x100000) { ab = t; break; }
+                }
+            }
             uint kid = 0;
             byte[] iv0 = null;
             for (int o = arr; o + 22 <= ab.Length && (BitConverter.ToUInt32(ab, o) >> 8) == 0x100000; o += 24)

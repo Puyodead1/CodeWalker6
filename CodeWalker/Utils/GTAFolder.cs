@@ -129,12 +129,15 @@ namespace CodeWalker
         }
 
         /// <summary>
-        /// Where the GTA VI keys come from: --exe= on the command line, then the dialog's choice, then gta6_keys.dat next
-        /// to CodeWalker, then the game exe (saved exe= or next to the game folder). null = ask.
+        /// Where the GTA VI keys come from: --exe= on the command line, then the PS5 build's eboot.bin (decrypted) in the
+        /// game folder, then the dialog's choice, then gta6_keys.dat next to CodeWalker, then the game exe (saved exe= or
+        /// next to the game folder). null = ask.
         /// </summary>
         public static string FindGta6Keys()
         {
             if (!string.IsNullOrEmpty(Gta6Exe) && File.Exists(Gta6Exe)) return Gta6Exe;
+            var eboot = string.IsNullOrEmpty(CurrentGTAFolder) ? null : Path.Combine(CurrentGTAFolder, "eboot.bin");
+            if (eboot != null && File.Exists(eboot)) return eboot;
             var chosen = Gta6Keys;
             if (!string.IsNullOrEmpty(chosen) && File.Exists(chosen)) return chosen;
             return Rpf9Keys.DefaultKeyFile() ?? FindGta6Exe();

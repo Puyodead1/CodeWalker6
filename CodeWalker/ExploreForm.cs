@@ -249,8 +249,8 @@ namespace CodeWalker
             {
                 using (var ofd = new OpenFileDialog())
                 {
-                    ofd.Title = "GTA VI keys: select the game exe (game_scarlett_master.exe) or a key file (gta6_keys.dat)";
-                    ofd.Filter = "Game exe or key file (*.exe;*.dat)|*.exe;*.dat|All files (*.*)|*.*";
+                    ofd.Title = "GTA VI keys: select the game exe (game_scarlett_master.exe, PS5: decrypted eboot.bin) or a key file (gta6_keys.dat)";
+                    ofd.Filter = "Game exe or key file (*.exe;*.bin;*.dat)|*.exe;*.bin;*.dat|All files (*.*)|*.*";
                     if (ofd.ShowDialog(this) != DialogResult.OK) { UpdateStatus("GTA VI: no keys selected."); return; }
                     src = ofd.FileName;
                 }

@@ -6,7 +6,8 @@ namespace CodeWalker.GameFiles
 {
     /// <summary>
     /// GTA VI (RPF9) cryptography. Nothing key-related is stored here: the white-box AES tables and key blobs are read
-    /// from the game executable (game_scarlett_master.exe, Xbox Series master build) at run time.
+    /// from the game executable (game_scarlett_master.exe, Xbox Series master build, or the PS5 build's decrypted
+    /// eboot.bin) at run time.
     /// TOC: white-box AES-256 decryption (cipher type 16) in CBC mode. File data: white-box AES-256 encryption
     /// (cipher type 17) used as a CTR keystream. See rpf9toc.py / rpf9x.py for the reverse-engineering notes.
     /// </summary>
@@ -14,11 +15,19 @@ namespace CodeWalker.GameFiles
     {
         public readonly byte[] Data;
         public readonly ulong ImageBase;
+        /// <summary>not a PE (the PS5 eboot.bin, a decrypted fSELF whose segment data is plain): file offsets are addresses</summary>
+        public readonly bool Raw;
         private readonly List<uint[]> Sections = new List<uint[]>(); // va, size, raw, rawsize
 
         public Rpf9Pe(string path)
         {
             Data = File.ReadAllBytes(path);
+            if (Data.Length < 0x40 || Data[0] != 'M' || Data[1] != 'Z')
+            {
+                Raw = true;
+                Sections.Add(new[] { 0u, (uint)Data.Length, 0u, (uint)Data.Length });
+                return;
+            }
             int pe = BitConverter.ToInt32(Data, 0x3c);
             int nsec = BitConverter.ToUInt16(Data, pe + 6);
             int opt = BitConverter.ToUInt16(Data, pe + 20);
@@ -312,6 +321,13 @@ namespace CodeWalker.GameFiles
         static readonly byte[] CTR_TABLES_SHA1 = Hex("98bd056264b3d73a97ed932c925079fc353131e9");
         const int TABLES_SIZE = 0x5000; // 16 x 256-byte input tables, then 16 x 256 u32 round tables
         static readonly byte[] MAGIC = { 0x8E, 0x9B, 0x3B, 0x4E }, CTR_MAGIC = { 0x5D, 0xCE, 0x18, 0x27 };
+        // PS5 eboot.bin (decrypted fSELF, 195555354 bytes): the same white-box tables as the Xbox exe (found by the hashes
+        // above, at file offsets 0x9B81130 / 0x9B8B130), but its own TOC IV (0x9B0DE30) and RPF9 header key blob
+        // (0x9EBD240). Its key table has no blob addresses (relocations), so the header key is found by hash too.
+        const uint PS5_IV_FNV = 0xCC522800, PS5_HEADER_FNV = 0xD024E3FA;
+        static readonly byte[] PS5_IV_SHA1 = Hex("ed52c4a1ff17520bd2fdaad64c6bd290a178b485");
+        static readonly byte[] PS5_HEADER_SHA1 = Hex("13a195e6689d7b9d1f9fb3ddeda67c21c77f3f71");
+        const int BLOB_SIZE = 4340;
 
         static byte[] Hex(string s)
         {
@@ -339,6 +355,52 @@ namespace CodeWalker.GameFiles
         {
             var p = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, KeyFileName);
             return File.Exists(p) ? p : null;
+        }
+
+        public const string Ps5KeyFileName = "gta6_keys_ps5.dat";
+        /// <summary>header key and IV of other builds (PS5): tried when the main header key finds no key descriptor</summary>
+        public static List<KeyValuePair<Rpf9Cipher, byte[]>> AltHeaders = new List<KeyValuePair<Rpf9Cipher, byte[]>>();
+
+        /// <summary>
+        /// Add another build's keys (same file format) to the loaded ones: its header key (id 0x10000001 in its file)
+        /// and IV become an alternative header, its other keys join the tables under their ids (ids already there stay).
+        /// </summary>
+        static void MergeKeyFile(string keyPath)
+        {
+            var d = File.ReadAllBytes(keyPath);
+            if (d.Length < 0x2C || d[0] != 'G' || d[1] != '6' || d[2] != 'K' || d[3] != 'Y' || BitConverter.ToInt32(d, 4) != 1) return;
+            int n = BitConverter.ToInt32(d, 0x28), p = 0x2C;
+            Rpf9Cipher header = null;
+            byte[] iv = null;
+            for (int i = 0; i < n && p + 8 <= d.Length; i++)
+            {
+                int kind = BitConverter.ToUInt16(d, p), size = BitConverter.ToUInt16(d, p + 2);
+                uint id = BitConverter.ToUInt32(d, p + 4);
+                int q = p + 8;
+                p = q + size;
+                if (p > d.Length) break;
+                if (kind == 1 && size >= 36)
+                {
+                    int cipher = d[q + 1];
+                    bool dec = d[q + 2] == 0;
+                    var key = new byte[32];
+                    Buffer.BlockCopy(d, q + 4, key, 0, 32);
+                    var c = new Rpf9Aes(key, dec);
+                    if (cipher == 16 && dec)
+                    {
+                        AllTocCiphers.Add(c);
+                        if (id == 0x10000001) header = c;
+                        else if (!TocCiphers.ContainsKey(id)) TocCiphers[id] = c;
+                    }
+                    else if (cipher == 17 && !dec && !DataCiphers.ContainsKey(id)) DataCiphers[id] = c;
+                }
+                else if (kind == 2 && size == 16 && id == 16)
+                {
+                    iv = new byte[16];
+                    Buffer.BlockCopy(d, q, iv, 0, 16);
+                }
+            }
+            if (header != null && iv != null) AltHeaders.Add(new KeyValuePair<Rpf9Cipher, byte[]>(header, iv));
         }
 
         /// <summary>
@@ -394,6 +456,10 @@ namespace CodeWalker.GameFiles
             if (tocIv == null || !toc.ContainsKey(0x10000001)) throw new InvalidDataException("key file has no RPF9 header key / IV");
             FixedIV = tocIv; LsnsIV = lsnsIv;
             TocCiphers = toc; DataCiphers = data; LsnsCiphers = lsns; AllTocCiphers = all; RelKeys = rel;
+            AltHeaders = new List<KeyValuePair<Rpf9Cipher, byte[]>>();
+            // the PS5 build's keys (tools\ps5_keys.py), beside the key file: its archives open in the same session
+            var ps5 = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(keyPath)), Ps5KeyFileName);
+            if (File.Exists(ps5) && !string.Equals(Path.GetFullPath(ps5), Path.GetFullPath(keyPath), StringComparison.OrdinalIgnoreCase)) MergeKeyFile(ps5);
             LoadNames(namesPath);
             KeyFilePath = keyPath;
             ExePath = null;
@@ -438,25 +504,26 @@ namespace CodeWalker.GameFiles
         }
 
         /// <summary>
-        /// Lift the RPF9 TOC and file data ciphers from the game exe (white-box tables, used as they are). Throws when the
-        /// exe doesn't hold the known tables. The PSIN string (type 19) and audio .rel keys come only from a key file.
+        /// Lift the RPF9 TOC and file data ciphers from the game exe: the Xbox game_scarlett_master.exe or the PS5
+        /// eboot.bin (decrypted). The white-box tables are used as they are. Throws when the file doesn't hold the known
+        /// tables. The PSIN string (type 19) and audio .rel keys come only from a key file.
         /// </summary>
         public static void Load(string exePath, string namesPath)
         {
             var pe = new Rpf9Pe(exePath);
-            ulong vaIv = pe.FindHashed(IV_FNV, IV_SHA1, 16);
+            string what = pe.Raw ? "PS5 eboot.bin" : "GTA VI exe";
+            ulong vaIv = pe.Raw ? pe.FindHashed(PS5_IV_FNV, PS5_IV_SHA1, 16) : pe.FindHashed(IV_FNV, IV_SHA1, 16);
             ulong vaIn = pe.FindHashed(TOC_TABLES_FNV, TOC_TABLES_SHA1, TABLES_SIZE);
             ulong vaCin = pe.FindHashed(CTR_TABLES_FNV, CTR_TABLES_SHA1, TABLES_SIZE);
+            ulong vaHeader = pe.Raw ? pe.FindHashed(PS5_HEADER_FNV, PS5_HEADER_SHA1, BLOB_SIZE) : 0;
             var missing = new List<string>();
             if (vaIv == 0) missing.Add("TOC IV");
             if (vaIn == 0) missing.Add("TOC cipher tables");
             if (vaCin == 0) missing.Add("file data cipher tables");
-            if (missing.Count > 0) throw new InvalidDataException("not a supported GTA VI exe, not found: " + string.Join(", ", missing));
+            if (pe.Raw && vaHeader == 0) missing.Add("RPF9 header key");
+            if (missing.Count > 0) throw new InvalidDataException("not a supported " + what + ", not found: " + string.Join(", ", missing));
 
             var blobs = pe.Blobs(MAGIC);
-            ulong keyTable = pe.FindKeyTable(blobs.Keys, out int rows);
-            if (keyTable == 0) throw new InvalidDataException("not a supported GTA VI exe: no key table");
-
             var toc = new Dictionary<uint, Rpf9Cipher>();
             var data = new Dictionary<uint, Rpf9Cipher>();
             var all = new List<Rpf9Cipher>();
@@ -467,26 +534,69 @@ namespace CodeWalker.GameFiles
                 byVa[kv.Key] = c;
                 all.Add(c);
             }
-            for (int i = 0; i < rows; i++)
+            if (pe.Raw)
             {
-                var e = pe.Read(keyTable + 24UL * (ulong)i, 24);
-                uint ty = BitConverter.ToUInt32(e, 0) >> 24, kid = BitConverter.ToUInt32(e, 4);
-                ulong ptr = BitConverter.ToUInt64(e, 8), len = BitConverter.ToUInt64(e, 16);
-                if (ty != 2) continue;
-                if (byVa.TryGetValue(ptr, out var tc)) { if (!toc.ContainsKey(kid)) toc[kid] = tc; continue; }
-                var blob = pe.Read(ptr, (int)len);
-                if (StartsWith(blob, CTR_MAGIC)) data[kid] = new Rpf9WhiteBox(pe, blob, vaCin, vaCin + 0x1000, true);
+                // the other TOC keys have no known ids here: Rpf9Toc.Decrypt finds an archive's TOC key by trial
+                if (byVa.TryGetValue(vaHeader, out var hc)) toc[0x10000001] = hc;
+                // file data keys: the key table's ids 0x10000021.. in the order the blobs lie in the file
+                var ctr = new List<ulong>(pe.Blobs(CTR_MAGIC).Keys);
+                ctr.Sort();
+                var ids = Ps5DataKeyIds(pe, ctr.Count == 0 ? 0 : ctr[ctr.Count - 1]);
+                for (int i = 0; i < ctr.Count; i++)
+                {
+                    uint kid = i < ids.Count ? ids[i] : 0x10000021u + (uint)i;
+                    data[kid] = new Rpf9WhiteBox(pe, pe.Read(ctr[i], BLOB_SIZE), vaCin, vaCin + 0x1000, true);
+                }
             }
-            if (!toc.ContainsKey(0x10000001)) throw new InvalidDataException("not a supported GTA VI exe: no RPF9 header key");
+            else
+            {
+                ulong keyTable = pe.FindKeyTable(blobs.Keys, out int rows);
+                if (keyTable == 0) throw new InvalidDataException("not a supported GTA VI exe: no key table");
+                for (int i = 0; i < rows; i++)
+                {
+                    var e = pe.Read(keyTable + 24UL * (ulong)i, 24);
+                    uint ty = BitConverter.ToUInt32(e, 0) >> 24, kid = BitConverter.ToUInt32(e, 4);
+                    ulong ptr = BitConverter.ToUInt64(e, 8), len = BitConverter.ToUInt64(e, 16);
+                    if (ty != 2) continue;
+                    if (byVa.TryGetValue(ptr, out var tc)) { if (!toc.ContainsKey(kid)) toc[kid] = tc; continue; }
+                    var blob = pe.Read(ptr, (int)len);
+                    if (StartsWith(blob, CTR_MAGIC)) data[kid] = new Rpf9WhiteBox(pe, blob, vaCin, vaCin + 0x1000, true);
+                }
+            }
+            if (!toc.ContainsKey(0x10000001)) throw new InvalidDataException("not a supported " + what + ": no RPF9 header key");
 
             FixedIV = pe.Read(vaIv, 16);
-            TocCiphers = toc; DataCiphers = data; AllTocCiphers = all;
+            TocCiphers = toc; DataCiphers = data; AllTocCiphers = all; AltHeaders = new List<KeyValuePair<Rpf9Cipher, byte[]>>();
             LsnsCiphers = new Dictionary<uint, Rpf9Cipher>(); LsnsIV = null; RelKeys = new Dictionary<int, uint[]>();
             LoadNames(namesPath);
             KeyFilePath = null;
             ExePath = exePath;
             NamesPath = namesPath;
             Loaded = true;
+        }
+
+        /// <summary>
+        /// PS5: the file data key ids (0x10000021..) of the key table {u32 type &lt;&lt; 24, u32 key id, u64 0 (a relocation),
+        /// u64 length}, which follows the key blobs and starts with the type-2 id 1 row; empty when it isn't found
+        /// </summary>
+        static List<uint> Ps5DataKeyIds(Rpf9Pe pe, ulong after)
+        {
+            var ids = new List<uint>();
+            var d = pe.Data;
+            for (long r = (long)after & ~7L; r + 24 <= d.Length; r += 8)
+            {
+                if (BitConverter.ToUInt32(d, (int)r) != 2u << 24 || BitConverter.ToUInt32(d, (int)r + 4) != 1 ||
+                    BitConverter.ToUInt64(d, (int)r + 8) != 0 || BitConverter.ToUInt64(d, (int)r + 16) != BLOB_SIZE) continue;
+                for (long o = r; o + 24 <= d.Length; o += 24)
+                {
+                    uint tw = BitConverter.ToUInt32(d, (int)o), kid = BitConverter.ToUInt32(d, (int)o + 4);
+                    ulong len = BitConverter.ToUInt64(d, (int)o + 16);
+                    if ((tw & 0xFFFFFF) != 0 || len == 0 || len > 0x10000) break;
+                    if (tw >> 24 == 2 && len == BLOB_SIZE && kid >> 4 == 0x1000002) ids.Add(kid);
+                }
+                break;
+            }
+            return ids;
         }
 
         static bool StartsWith(byte[] a, byte[] m) => a.Length >= m.Length && SameStart(a, m, m.Length);
